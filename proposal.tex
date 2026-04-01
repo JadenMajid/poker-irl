@@ -1,0 +1,125 @@
+\documentclass{article}
+\usepackage{fullpage}
+\usepackage{hyperref}
+\usepackage{parskip}
+\usepackage{amsmath}
+\usepackage{amsfonts}
+
+\title{\textbf{Project Proposal: Recovering Reward Parameters in Multi-Agent Poker via Inverse Reinforcement Learning}}
+\author{Sebastian Magana, Jaden Majid, Damian Suidgeest}
+
+\date{}
+
+\begin{document}
+\maketitle
+
+\section*{Problem and Motivation}
+
+A UBC professor with ongoing early-stage research in this space pointed us toward some recent work on inverse reinforcement learning (IRL) \cite{reddy2018, zeng2022, wei2024} and suggested
+it would be an interesting direction to explore for a project, with the possibility of continuing the work
+afterward with the professor toward a publication. After reading through some papers, the core idea we took away is that IRL
+methods have gotten rather good at recovering reward functions from observed behavior, but pretty much all of the applications and tests are in single-agent simulated physics settings like MuJoCo. A natural and underexplored direction is does this still
+work when multiple strategic agents with different reward functions are all interacting and
+adapting to each other.
+
+
+
+We think the multi-agent game setting is also interesting from an applications perspective not just to imitate expert behavior, but also to recognize suboptimal "expert" policies.
+If IRL can recover individualized reward parameters from strategic agents playing against each other, the same
+ideas could be extended to things like asset manager behaviors or
+government actors in international trade, both of which involve strategic agents operating
+under their own possibly-incorrect world beliefs. The professor's
+longer-term research interest runs in this direction, so we see the poker setting here as a tractable
+first step toward something broader.
+
+\section*{Plan}
+
+We plan to use use Leduc Hold'em, or another small-scale poker variant that is a standard
+benchmark in multi-agent RL research and is available through the RLCard library. We want it to be complex enough to be interesting but simple enough that we can get policies to converge without needing enormous
+compute.
+
+To build the agents, we will first train a single approximately-optimal base agent using a neutral reward (just maximize expected chips) and either a supervised learning approach to imitate expert poker datasets, or a self-play RL approach until rough approximate convergence. We then create 4 agent variants by initializing
+from this base agent and assigning each a distinct pair of latent hyperparameters: a risk-aversion
+coefficient $\lambda$ and a bluff-frequency bias $\beta$. These are baked directly into each
+agent's reward function:
+\[
+R_i = \mathbb{E}[\text{chips}] - \lambda_i \cdot \mathrm{Var}(\text{chips}) + \beta_i \cdot
+\mathbf{1}[\text{bluff-eligible spot}]
+\]
+Each agent then is trained via PPO RL against
+the other three, with their own reward fixed, until behavior stabilizes.
+
+Once policies have converged, we freeze all agents and
+simulate another large sample of rounds, collecting state-action-next-state trajectories. We then apply IRL
+to each agent individually, treating the other three frozen agents as part of the environment dynamics
+for now (we discuss this more below). The IRL procedure tries to recover $(\hat\lambda_i, \hat\beta_i)$
+for each agent by finding the reward parameters that best explain the observed behavior, updating for each state-action-next-state observed, somewhat like approximate inference.
+
+This will be similar to a MAP estimation problem, as we will likely place a prior over $(\lambda, \beta)$
+centered near the ``neutral'' values,
+and then combine this with the likelihood of the observed action sequences under different reward
+hypotheses.
+
+Since we know the true $(\lambda_i, \beta_i)$ values, our main evaluation metric
+is recovery MSE: how close are the recovered estimates to the ground truth. We'll also likely report
+held-out log-likelihood of the recovered policy on unseen game-play rounds as a secondary metric.
+
+\textbf{Ablation:} To understand what effect the multi-agent co-adaptation has on IRL recovery, we
+will also run a cleaner version: one agent trains in the same environment but with the other three replaced
+by a fixed common policy, removing the strategic interaction. Comparing this recovery accuracy against the full multi-agent setting should tell us if
+co-adaptation makes the problem substantially harder for IRL.
+
+\textbf{Simplifying Assumptions:} Treating co-players as environment
+dynamics during IRL is a simplification; the more principled approach would be to jointly infer all agents'
+reward functions simultaneously, accounting for the fact that each agent's policy is a best response
+to the others. We plan to spend some time working through the theory here and will aim to handle
+this more carefully if tractable within scope. If the dynamics get too complex to model well,
+we'll document what assumptions we made and why.
+
+\section*{Contribution}
+
+This project falls most naturally into the "new application" and "generalization to new
+setting" categories from the project guidelines. We're taking IRL, which has mostly been studied
+in single-agent robotics-style environments, and asking whether it still works when the observed
+behavior comes from agents that co-adapted to each other in a multi-agent game. The controlled
+setup (ground-truth 2D parameter space, ablation) means we can say
+something fairly concrete about how well IRL transfers to this kind of setting. We think this is a useful contribution both for the IRL literature and as
+a stepping stone toward more impactful applied settings. We're also optimistic that even partial or negative results, like the ablation showing how co-adaptation substantially affects
+recovery, could be interesting enough to build on toward a paper or to motivate more efficient multi-agent IRL algorithms, or the comparison of how well different current IRL algorithms extend to this multi-agent environment.
+
+
+
+The most closely related existing work is probably \cite{fu2021}, which proposed a method
+that reduces multi-agent IRL to independent single-agent problems by holding co-players fixed. They mostly worked in auction settings, whereas we will use poker with a
+richer sequential structure. Also we will have access to ground-truth reward parameters, meaning we can directly measure scalar recovery error rather than relying on regret or policy
+imitation as a proxy. This gives us a more direct handle on whether IRL is actually recovering the
+intended behavioral objectives, which \cite{fu2021} deliberately sidesteps due to reward ambiguity concerns.
+
+
+\begin{thebibliography}{9}
+
+\bibitem[Reddy et~al. (2018)]{reddy2018}
+Reddy, S., Dragan, A., \& Levine, S. (2018).
+\textit{Where Do You Think You're Going?: Inferring Beliefs about Dynamics from Behavior}.
+NeurIPS 2018. arXiv:1805.08010.
+
+\bibitem[Zeng et~al. (2022)]{zeng2022}
+Zeng, S., Li, C., Garcia, A., \& Hong, M. (2022).
+\textit{Maximum-Likelihood Inverse Reinforcement Learning with Finite-Time Guarantees}.
+NeurIPS 2022. \textit{Advances in Neural Information Processing Systems}, 35, 10122--10135.
+arXiv:2210.01808.
+
+\bibitem[Wei et~al. (2024)]{wei2024}
+Wei, R., Zeng, S., Li, C., Garcia, A., McDonald, A., \& Hong, M. (2024).
+\textit{A Bayesian Approach to Robust Inverse Reinforcement Learning}.
+arXiv:2309.08571.
+
+\bibitem[Fu et~al. (2021)]{fu2021}
+Fu, J., Tacchetti, A., Perolat, J., \& Bachrach, Y. (2021).
+\textit{Evaluating Strategic Structures in Multi-Agent Inverse Reinforcement Learning}.
+\textit{Journal of Artificial Intelligence Research}, 71, 925--951.
+DOI: 10.1613/jair.1.12594.
+
+\end{thebibliography}
+
+\end{document}
