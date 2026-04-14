@@ -86,10 +86,10 @@ class RewardParams:
     beta:  float = 0.0
 
     def __post_init__(self) -> None:
-        if self.alpha < 0:
-            raise ValueError(f"alpha must be ≥ 0, got {self.alpha}.")
-        if self.beta < 0:
-            raise ValueError(f"beta must be ≥ 0, got {self.beta}.")
+        # alpha and beta may be negative to represent risk-seeking / pot-avoidant agents.
+        # No validation constraints on sign — the IRL recovery experiment requires
+        # agents that span all four quadrants of (alpha, beta) space.
+        pass
 
     def to_array(self) -> np.ndarray:
         """Serialise to a 2-float numpy array for optimisation."""

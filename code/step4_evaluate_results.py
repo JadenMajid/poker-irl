@@ -1,42 +1,42 @@
 """
 step4_evaluate_results.py
 --------------------------
-Load the IRL estimates and compute evaluation metrics:
+Load IRL estimates and compute evaluation metrics:
 
   1. Per-parameter MSE and RMSE (alpha, beta, joint)
-  2. Held-out Log-Likelihood (HOLL) — the primary secondary metric
-  3. Parameter recovery visualisation data (for inspection)
-  4. Convergence quality analysis
+  2. Held-out Log-Likelihood (HOLL) — secondary metric
+  3. HOLL recovery percentage — normalised quality metric
+  4. Convergence quality analysis (how many steps to convergence)
 
-Held-out Log-Likelihood (HOLL) methodology
--------------------------------------------
+Held-out Log-Likelihood (HOLL)
+-------------------------------
 The HOLL answers: "Under the recovered reward parameters, how likely is the
 agent's HELD-OUT behaviour?"
 
-Setup:
-  - Split collected hands into 80% train (used by IRL) / 20% held-out.
-  - For the held-out set, for each (seat, step), evaluate:
+We split collected hands 80/20 train/held-out.  For each held-out hand:
 
-        HOLL = (1/N_heldout) Σ_t log π_{θ̂}(a_t | s_t)
+    HOLL = (1/N) Σ log π_{θ̂}(a_t | s_t)
 
-  where π_{θ̂} is the Boltzmann-rational policy under the estimated parameters:
+where π_{θ̂} is the Boltzmann-rational policy under estimated parameters.
+The Q-value adjustment is the same reparametrised form used in IRL:
 
-        log π_θ(a_t | s_t) = Q_θ(s_t, a_t) - log Σ_{a'} exp(Q_θ(s_t, a'))
+    Q_{θ̂}(s, a_obs) = Q₀(s, a_obs) + alpha_norm_hat × A_var_norm + beta_hat × A_pot
 
-  with Q_θ(s,a) = Q₀(s,a) + α̂·A_α + β̂·A_pot  (same decomposition as IRL).
+Comparison baselines
+--------------------
+  HOLL_true    — upper bound: log-likelihood under the TRUE parameters
+  HOLL_neutral — under (α=0, β=0): no reward shaping beyond base policy
+  HOLL_random  — lower bound: uniform random policy = -log(n_legal)
 
-Comparison baselines for HOLL:
-  (a) HOLL_neutral  — log-likelihood under (α=0, β=0) neutral policy
-  (b) HOLL_true     — log-likelihood under the TRUE (α, β) parameters
-  (c) HOLL_random   — expected log-likelihood of a uniform random policy
-                    = -log(n_legal_actions) ≈ -log(5) ≈ -1.609
+HOLL recovery %:
+    100 × (HOLL_est - HOLL_neutral) / |HOLL_true - HOLL_neutral|
 
-A good IRL result should have:
-    HOLL_true > HOLL_estimate > HOLL_neutral > HOLL_random
+This measures what fraction of the gap between neutral and true was recovered.
 
-Output files:
-  irl_results/evaluation_metrics.json      — all scalar metrics
-  irl_results/evaluation_details.json      — per-seat breakdown
+Output files
+------------
+  irl_results/evaluation_metrics.json   — aggregate scalar metrics
+  irl_results/evaluation_details.json  — per-seat breakdown
 """
 
 from __future__ import annotations
@@ -51,27 +51,28 @@ from typing import Dict, List, Optional, Tuple
 import numpy as np
 import torch
 import torch.nn.functional as F
-from torch.distributions import Categorical
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from agent import ActorCriticNetwork, NUM_ACTIONS, legal_action_mask
+from agent import ActorCriticNetwork, NUM_ACTIONS
 from feature_encoder import FeatureEncoder, FEATURE_DIM
-from game_state import NUM_PLAYERS, PlayerObservation
-from reward import RewardParams, POT_NORM
+from game_state import NUM_PLAYERS
+from reward import POT_NORM
 from step3_collect_and_run_irl import (
     HandRecord,
     compute_rolling_variance_penalties,
     compute_mc_returns_per_hand,
+    fill_var_penalties,
     CHECKPOINT_DIR,
     IRL_DIR,
     DEVICE,
     HIDDEN_DIM,
+    VAR_WINDOW,
 )
 
 # ── configuration ──────────────────────────────────────────────────────────
 
-TRAIN_SPLIT = 0.8   # fraction of hands used for IRL (the rest are held-out)
+TRAIN_SPLIT = 0.8
 
 # ---------------------------------------------------------------------------
 logging.basicConfig(
@@ -83,35 +84,33 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
-# HOLL computation
+# HOLL computation helpers
 # ---------------------------------------------------------------------------
 
 def compute_holl_for_seat(
-    seat:         int,
-    step_data:    List[Tuple],    # from compute_mc_returns_per_hand
-    target_net:   ActorCriticNetwork,
-    alpha:        float,
-    beta:         float,
-    device:       torch.device,
-    V_var:        float,
-    V_pot:        float,
+    step_data:   List[Tuple],
+    target_net:  ActorCriticNetwork,
+    alpha:       float,
+    beta:        float,
+    var_norm:    float,
+    V_var:       float,
+    V_pot:       float,
+    device:      torch.device,
 ) -> float:
     """
-    Compute the held-out log-likelihood for one set of reward parameters.
+    Compute mean held-out log-likelihood for one set of reward parameters.
 
-    Parameters
-    ----------
-    step_data  : List of (feats, masks, acts, returns) for held-out hands.
-    target_net : Frozen target agent network (provides Q₀ base logits).
-    alpha, beta: Reward parameters to evaluate.
-    V_var, V_pot: Advantage baselines (estimated on training set).
+    For each hand's terminal step:
+        log π_θ(a_obs | s) = Q_θ(s, a_obs) - log Σ_{a'} exp(Q_θ(s, a'))
 
-    Returns
-    -------
-    Mean log π_θ(a_t | s_t) over all terminal steps in step_data.
+    where Q_θ(s, a_obs) = Q₀(s, a_obs) + alpha_norm × A_var_norm + beta × A_pot
+    and for unobserved actions, shaping ≈ 0 (same approximation as in IRL).
+
+    alpha_norm = alpha × var_norm  (convert true alpha to normalised space)
     """
-    total_ll = 0.0
-    n_steps  = 0
+    alpha_norm = alpha * var_norm
+    total_ll   = 0.0
+    n          = 0
 
     for feats, masks, acts, returns in step_data:
         feat_t = torch.tensor(feats[-1:], dtype=torch.float32, device=device)
@@ -121,97 +120,119 @@ def compute_holl_for_seat(
         with torch.no_grad():
             base_logits, _ = target_net(feat_t, mask_t)
 
-        adj_logits  = base_logits[0].clone().float()
-        A_var       = float(returns[-1, 1]) - V_var
-        A_pot       = float(returns[-1, 2]) - V_pot
-        shaping     = alpha * A_var + beta * A_pot
-        adj_logits[a_obs] = adj_logits[a_obs] + shaping
+        adj    = base_logits[0].clone().float()
+        A_vn   = (float(returns[-1, 1]) - V_var) / max(var_norm, 1.0)
+        A_pot  = float(returns[-1, 2]) - V_pot
+        shaping = alpha_norm * A_vn + beta * A_pot
+        adj[a_obs] = adj[a_obs] + shaping
 
-        # log π_θ(a_obs | s)
-        legal_mask_bool = mask_t[0]
-        log_z    = torch.logsumexp(adj_logits[legal_mask_bool], dim=0)
-        ll       = (adj_logits[a_obs] - log_z).item()
+        legal  = mask_t[0]
+        log_z  = torch.logsumexp(adj[legal], dim=0)
+        ll     = (adj[a_obs] - log_z).item()
         total_ll += ll
-        n_steps  += 1
+        n        += 1
 
-    return total_ll / max(n_steps, 1)
+    return total_ll / max(n, 1)
 
 
 def compute_random_holl(step_data: List[Tuple]) -> float:
-    """
-    Baseline: HOLL under a uniform random policy.
-    E[log π_uniform(a | s)] = -log(n_legal_actions)
-    """
-    total_ll = 0.0
-    n        = 0
-    for feats, masks, acts, returns in step_data:
+    """Lower-bound HOLL: E[log π_uniform] = -log(n_legal)."""
+    total = 0.0
+    n     = 0
+    for _, masks, _, _ in step_data:
         n_legal = int(masks[-1].sum())
         if n_legal > 0:
-            total_ll += -np.log(n_legal)
-            n += 1
-    return total_ll / max(n, 1)
+            total += -np.log(n_legal)
+            n     += 1
+    return total / max(n, 1)
 
 
 # ---------------------------------------------------------------------------
 # Main evaluation
 # ---------------------------------------------------------------------------
 
-def run_evaluation(is_ablation: bool = False, ablation_tag: str = "") -> None:
+def run_evaluation(
+    is_ablation:  bool = False,
+    ablation_tag: str  = "",
+) -> Tuple[Dict, Dict]:
+    """
+    Load IRL estimates and trajectory data, compute all metrics.
+
+    Returns (all_metrics, seat_details) dicts.
+    """
     device = torch.device(DEVICE)
     suffix = f"_{ablation_tag}" if ablation_tag else ""
 
     # ── Load IRL estimates ─────────────────────────────────────────────────
-    estimates_path = os.path.join(IRL_DIR, f"irl_estimates{suffix}.json")
-    with open(estimates_path) as f:
-        irl_estimates = {r["seat"]: r for r in json.load(f)}
+    est_path = os.path.join(IRL_DIR, f"irl_estimates{suffix}.json")
+    if not os.path.exists(est_path):
+        raise FileNotFoundError(f"IRL estimates not found: {est_path}  "
+                                "(run step3 first)")
+    with open(est_path) as f:
+        raw_ests = json.load(f)
+    irl_estimates = {r["seat"]: r for r in raw_ests if "error" not in r}
     log.info("Loaded IRL estimates for %d seats.", len(irl_estimates))
 
-    # ── Load trajectory data ───────────────────────────────────────────────
+    # ── Load trajectories ──────────────────────────────────────────────────
     traj_path = os.path.join(IRL_DIR, f"hand_records{suffix}.pkl")
+    if not os.path.exists(traj_path):
+        raise FileNotFoundError(f"Hand records not found: {traj_path}  "
+                                "(run step3 first)")
     with open(traj_path, "rb") as f:
         hand_records: List[HandRecord] = pickle.load(f)
     log.info("Loaded %d hand records.", len(hand_records))
 
-    n_train = int(len(hand_records) * TRAIN_SPLIT)
+    # 80/20 split (same split as used during IRL — consistent baselines)
+    n_train       = int(len(hand_records) * TRAIN_SPLIT)
     train_records = hand_records[:n_train]
     held_records  = hand_records[n_train:]
-    log.info("Split: %d train / %d held-out.", len(train_records), len(held_records))
+    log.info("Split: %d train / %d held-out.", n_train, len(held_records))
 
-    # Compute variance penalties on TRAINING set (for baselines)
-    var_pen_train = compute_rolling_variance_penalties(train_records, window=100)
-    mc_train      = compute_mc_returns_per_hand(train_records, var_pen_train)
+    # Variance penalties — compute on TRAINING set for baselines,
+    # independently on HELD-OUT set for evaluation
+    var_ph_train, var_std_train = compute_rolling_variance_penalties(
+        train_records, window=VAR_WINDOW
+    )
+    mc_train = compute_mc_returns_per_hand(train_records, var_ph_train)
 
-    # Compute variance penalties on HELD-OUT set
-    var_pen_held  = compute_rolling_variance_penalties(held_records, window=100)
-    mc_held       = compute_mc_returns_per_hand(held_records, var_pen_held)
+    var_ph_held, var_std_held = compute_rolling_variance_penalties(
+        held_records, window=VAR_WINDOW
+    )
+    mc_held = compute_mc_returns_per_hand(held_records, var_ph_held)
 
     # ── Load true parameters ───────────────────────────────────────────────
-    params_path = os.path.join(CHECKPOINT_DIR,
-                               "ablation_agent_params.json" if is_ablation
-                               else "perturbed_agent_params.json")
+    params_key  = "ablation_agent_params.json" if is_ablation else "perturbed_agent_params.json"
+    params_path = os.path.join(CHECKPOINT_DIR, params_key)
     with open(params_path) as f:
-        true_params = {p["seat"]: (p["alpha"], p["beta"]) for p in json.load(f)}
+        true_params: Dict[int, Tuple[float, float]] = {
+            p["seat"]: (p["alpha"], p["beta"]) for p in json.load(f)
+        }
 
-    all_metrics   = {}
-    seat_details  = {}
+    seat_details: Dict[int, Dict] = {}
 
     # ── Per-seat evaluation ────────────────────────────────────────────────
     for seat in sorted(irl_estimates.keys()):
-        est     = irl_estimates[seat]
+        est          = irl_estimates[seat]
         α_true, β_true = true_params[seat]
-        α_hat   = est["est_alpha"]
-        β_hat   = est["est_beta"]
+        α_hat        = est["est_alpha"]
+        β_hat        = est["est_beta"]
+        var_norm     = est.get("var_norm", var_std_train.get(seat, 1.0))
 
         log.info("\n--- Seat %d ---", seat)
-        log.info("  True: α=%.4f  β=%.4f", α_true, β_true)
-        log.info("  Est:  α=%.4f  β=%.4f", α_hat,  β_hat)
+        log.info("  True:  α=%.5f   β=%.4f", α_true, β_true)
+        log.info("  Est:   α=%.5f   β=%.4f", α_hat,  β_hat)
+        log.info("  VAR_NORM=%.0f", var_norm)
 
-        # Load target network
-        agent_path = os.path.join(
-            CHECKPOINT_DIR,
-            f"ablation_perturbed_agent_0.pt" if is_ablation
-            else f"perturbed_agent_{seat}.pt"
+        # Load agent network
+        agent_path = (
+            os.path.join(CHECKPOINT_DIR, "ablation_perturbed_agent_0.pt")
+            if is_ablation
+            else os.path.join(CHECKPOINT_DIR, f"perturbed_agent_{seat}.pt")
         )
+        if not os.path.exists(agent_path):
+            log.warning("  Agent checkpoint missing: %s", agent_path)
+            continue
+
         ckpt = torch.load(agent_path, map_location=device)
         target_net = ActorCriticNetwork(
             input_dim=ckpt.get("feature_dim", FEATURE_DIM),
@@ -219,106 +240,117 @@ def run_evaluation(is_ablation: bool = False, ablation_tag: str = "") -> None:
         ).to(device)
         target_net.load_state_dict(ckpt["network_state"])
         target_net.eval()
+        for p in target_net.parameters():
+            p.requires_grad_(False)
 
-        # Compute baselines from TRAINING set
-        train_data = mc_train.get(seat, [])
-        V_var_train = float(np.mean([d[3][-1, 1] for d in train_data])) if train_data else 0.0
-        V_pot_train = float(np.mean([d[3][-1, 2] for d in train_data])) if train_data else 0.0
+        # Baselines from training set
+        train_d = mc_train.get(seat, [])
+        V_var_train = float(np.mean([d[3][-1, 1] for d in train_d])) if train_d else 0.0
+        V_pot_train = float(np.mean([d[3][-1, 2] for d in train_d])) if train_d else 0.0
 
-        held_data = mc_held.get(seat, [])
-        if not held_data:
+        held_d = mc_held.get(seat, [])
+        if not held_d:
             log.warning("  No held-out data for seat %d.", seat)
             continue
 
-        # HOLL under estimated parameters
+        # HOLL under four parameter settings
         holl_est = compute_holl_for_seat(
-            seat, held_data, target_net, α_hat, β_hat, device, V_var_train, V_pot_train
+            held_d, target_net, α_hat,   β_hat,   var_norm,
+            V_var_train, V_pot_train, device
         )
-        # HOLL under true parameters
         holl_true = compute_holl_for_seat(
-            seat, held_data, target_net, α_true, β_true, device, V_var_train, V_pot_train
+            held_d, target_net, α_true,  β_true,  var_norm,
+            V_var_train, V_pot_train, device
         )
-        # HOLL under neutral (0, 0)
         holl_neutral = compute_holl_for_seat(
-            seat, held_data, target_net, 0.0, 0.0, device, V_var_train, V_pot_train
+            held_d, target_net, 0.0, 0.0, var_norm,
+            V_var_train, V_pot_train, device
         )
-        # HOLL under random policy
-        holl_random = compute_random_holl(held_data)
+        holl_random = compute_random_holl(held_d)
 
-        α_mse  = (α_hat - α_true) ** 2
-        β_mse  = (β_hat - β_true) ** 2
+        α_mse     = (α_hat - α_true) ** 2
+        β_mse     = (β_hat - β_true) ** 2
         joint_mse = (α_mse + β_mse) / 2.0
 
-        log.info("  α MSE:  %.6f  (α error: %.4f)", α_mse, α_hat - α_true)
-        log.info("  β MSE:  %.6f  (β error: %.4f)", β_mse, β_hat - β_true)
-        log.info("  Joint MSE: %.6f", joint_mse)
-        log.info("  HOLL_estimated: %.4f", holl_est)
-        log.info("  HOLL_true:      %.4f  (upper bound)", holl_true)
-        log.info("  HOLL_neutral:   %.4f", holl_neutral)
-        log.info("  HOLL_random:    %.4f  (lower bound)", holl_random)
-        log.info("  HOLL recovery:  %.2f%%",
-                 100 * (holl_est - holl_neutral) / max(abs(holl_true - holl_neutral), 1e-8))
+        holl_gap       = abs(holl_true - holl_neutral)
+        holl_recovery  = (
+            100.0 * (holl_est - holl_neutral) / holl_gap
+            if holl_gap > 1e-8 else float("nan")
+        )
+
+        log.info("  α MSE:            %.6f  (error: %+.5f)", α_mse, α_hat - α_true)
+        log.info("  β MSE:            %.6f  (error: %+.4f)", β_mse, β_hat - β_true)
+        log.info("  Joint MSE:        %.6f", joint_mse)
+        log.info("  HOLL estimated:   %.4f", holl_est)
+        log.info("  HOLL true:        %.4f  ← upper bound", holl_true)
+        log.info("  HOLL neutral:     %.4f", holl_neutral)
+        log.info("  HOLL random:      %.4f  ← lower bound", holl_random)
+        log.info("  HOLL recovery:    %.1f%%", holl_recovery)
 
         seat_details[seat] = {
-            "seat":          seat,
-            "true_alpha":    α_true,
-            "true_beta":     β_true,
-            "est_alpha":     α_hat,
-            "est_beta":      β_hat,
-            "alpha_mse":     α_mse,
-            "beta_mse":      β_mse,
-            "joint_mse":     joint_mse,
-            "alpha_rmse":    α_mse ** 0.5,
-            "beta_rmse":     β_mse ** 0.5,
-            "holl_estimated":holl_est,
-            "holl_true":     holl_true,
-            "holl_neutral":  holl_neutral,
-            "holl_random":   holl_random,
-            "holl_recovery_pct": 100 * (holl_est - holl_neutral) / max(abs(holl_true - holl_neutral), 1e-8),
+            "seat":              seat,
+            "true_alpha":        α_true,
+            "true_beta":         β_true,
+            "est_alpha":         α_hat,
+            "est_beta":          β_hat,
+            "alpha_mse":         α_mse,
+            "beta_mse":          β_mse,
+            "joint_mse":         joint_mse,
+            "alpha_rmse":        α_mse ** 0.5,
+            "beta_rmse":         β_mse ** 0.5,
+            "holl_estimated":    holl_est,
+            "holl_true":         holl_true,
+            "holl_neutral":      holl_neutral,
+            "holl_random":       holl_random,
+            "holl_recovery_pct": holl_recovery,
+            "n_irl_steps":       est.get("n_steps", None),
+            "irl_converged":     est.get("converged", None),
+            "var_norm":          var_norm,
         }
 
-    # ── Aggregate metrics ──────────────────────────────────────────────────
+    # ── Aggregate ──────────────────────────────────────────────────────────
+    all_metrics: Dict = {}
     if seat_details:
-        mean_α_mse    = float(np.mean([v["alpha_mse"]  for v in seat_details.values()]))
-        mean_β_mse    = float(np.mean([v["beta_mse"]   for v in seat_details.values()]))
-        mean_joint    = float(np.mean([v["joint_mse"]  for v in seat_details.values()]))
-        mean_holl_est = float(np.mean([v["holl_estimated"] for v in seat_details.values()]))
-        mean_holl_tr  = float(np.mean([v["holl_true"]  for v in seat_details.values()]))
-        mean_recovery = float(np.mean([v["holl_recovery_pct"] for v in seat_details.values()]))
-
+        vals = list(seat_details.values())
         all_metrics = {
-            "mean_alpha_mse":          mean_α_mse,
-            "mean_beta_mse":           mean_β_mse,
-            "mean_joint_mse":          mean_joint,
-            "mean_alpha_rmse":         mean_α_mse ** 0.5,
-            "mean_beta_rmse":          mean_β_mse ** 0.5,
-            "mean_holl_estimated":     mean_holl_est,
-            "mean_holl_true":          mean_holl_tr,
-            "mean_holl_recovery_pct":  mean_recovery,
+            "mean_alpha_mse":          float(np.mean([v["alpha_mse"]       for v in vals])),
+            "mean_beta_mse":           float(np.mean([v["beta_mse"]        for v in vals])),
+            "mean_joint_mse":          float(np.mean([v["joint_mse"]       for v in vals])),
+            "mean_alpha_rmse":         float(np.mean([v["alpha_rmse"]      for v in vals])),
+            "mean_beta_rmse":          float(np.mean([v["beta_rmse"]       for v in vals])),
+            "mean_holl_estimated":     float(np.mean([v["holl_estimated"]  for v in vals])),
+            "mean_holl_true":          float(np.mean([v["holl_true"]       for v in vals])),
+            "mean_holl_neutral":       float(np.mean([v["holl_neutral"]    for v in vals])),
+            "mean_holl_random":        float(np.mean([v["holl_random"]     for v in vals])),
+            "mean_holl_recovery_pct":  float(np.nanmean([v["holl_recovery_pct"] for v in vals])),
             "n_seats_evaluated":       len(seat_details),
             "is_ablation":             is_ablation,
         }
 
-        log.info("\n" + "="*60)
+        log.info("\n" + "=" * 60)
         log.info("AGGREGATE EVALUATION METRICS")
-        log.info("="*60)
-        log.info("  Mean α MSE:          %.6f  (RMSE %.4f)", mean_α_mse, mean_α_mse**0.5)
-        log.info("  Mean β MSE:          %.6f  (RMSE %.4f)", mean_β_mse, mean_β_mse**0.5)
-        log.info("  Mean joint MSE:      %.6f", mean_joint)
-        log.info("  Mean HOLL (est):     %.4f", mean_holl_est)
-        log.info("  Mean HOLL (true):    %.4f", mean_holl_tr)
-        log.info("  Mean HOLL recovery:  %.2f%%", mean_recovery)
+        log.info("=" * 60)
+        log.info("  Mean α MSE:          %.6f  (RMSE %.5f)",
+                 all_metrics["mean_alpha_mse"], all_metrics["mean_alpha_rmse"])
+        log.info("  Mean β MSE:          %.6f  (RMSE %.4f)",
+                 all_metrics["mean_beta_mse"],  all_metrics["mean_beta_rmse"])
+        log.info("  Mean joint MSE:      %.6f",  all_metrics["mean_joint_mse"])
+        log.info("  Mean HOLL (est):     %.4f",  all_metrics["mean_holl_estimated"])
+        log.info("  Mean HOLL (true):    %.4f",  all_metrics["mean_holl_true"])
+        log.info("  Mean HOLL recovery:  %.1f%%",all_metrics["mean_holl_recovery_pct"])
 
     # ── Save ───────────────────────────────────────────────────────────────
-    out_path = os.path.join(IRL_DIR, f"evaluation_metrics{suffix}.json")
-    with open(out_path, "w") as f:
-        json.dump(all_metrics, f, indent=2)
-    log.info("Saved: %s", out_path)
+    suffix2 = f"_{ablation_tag}" if ablation_tag else ""
 
-    detail_path = os.path.join(IRL_DIR, f"evaluation_details{suffix}.json")
-    with open(detail_path, "w") as f:
+    metrics_path = os.path.join(IRL_DIR, f"evaluation_metrics{suffix2}.json")
+    with open(metrics_path, "w") as f:
+        json.dump(all_metrics, f, indent=2)
+    log.info("Saved: %s", metrics_path)
+
+    details_path = os.path.join(IRL_DIR, f"evaluation_details{suffix2}.json")
+    with open(details_path, "w") as f:
         json.dump(list(seat_details.values()), f, indent=2)
-    log.info("Saved: %s", detail_path)
+    log.info("Saved: %s", details_path)
 
     return all_metrics, seat_details
 
