@@ -366,14 +366,20 @@ def run_training() -> None:
 
         # Intermediate save
         if hand_count % SAVE_EVERY == 0:
-            _save_checkpoint(network, hand_count, CHECKPOINT_DIR, "base_agent_ckpt")
+            _save_checkpoint(
+                network, hand_count, CHECKPOINT_DIR, "base_agent_ckpt",
+                detector.latest_mean_kl(), stats["policy_loss"], stats["value_loss"], stats["entropy"]
+            )
 
         if detector.converged or hand_count >= MAX_HANDS:
             break
 
     # ── Final save ────────────────────────────────────────────────────────
     log.info("Training complete.  Total hands: %d  Updates: %d", hand_count, update_count)
-    _save_checkpoint(network, hand_count, CHECKPOINT_DIR, "base_agent")
+    _save_checkpoint(
+        network, hand_count, CHECKPOINT_DIR, "base_agent",
+        detector.latest_mean_kl(), stats["policy_loss"], stats["value_loss"], stats["entropy"]
+    )
 
     config_meta = {
         "hand_count":    hand_count,
@@ -397,10 +403,14 @@ def run_training() -> None:
 
 
 def _save_checkpoint(
-    network:  ActorCriticNetwork,
-    step:     int,
-    out_dir:  str,
-    name:     str,
+    network:      ActorCriticNetwork,
+    step:         int,
+    out_dir:      str,
+    name:         str,
+    mean_kl:      float,
+    policy_loss:  float,
+    value_loss:   float,
+    entropy:      float,
 ) -> None:
     path = os.path.join(out_dir, f"{name}.pt")
     torch.save({
@@ -409,6 +419,10 @@ def _save_checkpoint(
         "feature_dim":   FEATURE_DIM,
         "num_actions":   NUM_ACTIONS,
         "step":          step,
+        "mean_kl":       mean_kl,
+        "policy_loss":   policy_loss,
+        "value_loss":    value_loss,
+        "entropy":       entropy,
     }, path)
 
 
