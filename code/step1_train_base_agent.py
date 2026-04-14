@@ -106,6 +106,19 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
+def _format_eta(seconds: float) -> str:
+    """Format ETA seconds as HH:MM:SS (or DDd HH:MM:SS for long runs)."""
+    if not np.isfinite(seconds) or seconds < 0:
+        return "unknown"
+    total = int(round(seconds))
+    days, rem = divmod(total, 86_400)
+    hours, rem = divmod(rem, 3_600)
+    mins, secs = divmod(rem, 60)
+    if days > 0:
+        return f"{days}d {hours:02d}:{mins:02d}:{secs:02d}"
+    return f"{hours:02d}:{mins:02d}:{secs:02d}"
+
+
 # ---------------------------------------------------------------------------
 # Shared-policy agent wrapper
 # ---------------------------------------------------------------------------
@@ -251,6 +264,12 @@ def run_training() -> None:
     training_log = []
     hand_count   = 0
     update_count = 0
+    stats = {
+        "policy_loss": float("nan"),
+        "value_loss": float("nan"),
+        "entropy": float("nan"),
+        "clip_frac": float("nan"),
+    }
     start_time   = time.time()
 
     log.info("Starting self-play training.  MAX_HANDS=%d", MAX_HANDS)
@@ -326,10 +345,13 @@ def run_training() -> None:
             if hand_count % LOG_EVERY == 0:
                 elapsed  = time.time() - start_time
                 hands_ph = hand_count / max(elapsed, 1) * 3600
+                hands_ps = hand_count / max(elapsed, 1e-6)
+                remaining_hands = max(MAX_HANDS - hand_count, 0)
+                eta_seconds = remaining_hands / max(hands_ps, 1e-9)
                 mean_kl  = detector.latest_mean_kl()
                 log.info(
-                    "Hand %7d | Updates %4d | Mean KL %.5f | %.0f hands/hr",
-                    hand_count, update_count, mean_kl, hands_ph,
+                    "Hand %7d | Updates %4d | Mean KL %.5f | %.0f hands/hr | ETA %s",
+                    hand_count, update_count, mean_kl, hands_ph, _format_eta(eta_seconds)
                 )
 
             if converged:
