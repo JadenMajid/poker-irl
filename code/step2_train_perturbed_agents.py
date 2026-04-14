@@ -365,7 +365,18 @@ def run_fine_tuning() -> None:
         # Intermediate save
         if hand_count % SAVE_EVERY == 0:
             for seat, agent in enumerate(agents):
-                _save_agent(agent.network, seat, hand_count, CHECKPOINT_DIR, "perturbed_ckpt")
+                # We need the last stats for this seat to save losses
+                # In Step 2, stats are per-seat, so we'll pass the latest ones from training_log if available
+                last_stats = next((item for item in reversed(training_log) if item["seat"] == seat), None)
+                if last_stats:
+                    _save_agent(
+                        agent.network, seat, hand_count, CHECKPOINT_DIR, "perturbed_ckpt",
+                        last_stats["policy_loss"], last_stats["value_loss"], 
+                        last_stats["entropy"], last_stats["kl_penalty"], last_stats["mean_kl"]
+                    )
+                else:
+                    # Fallback if no update yet
+                    _save_agent(agent.network, seat, hand_count, CHECKPOINT_DIR, "perturbed_ckpt")
 
         if all_converged:
             log.info("All 4 agents converged at hand %d.", hand_count)
@@ -375,7 +386,15 @@ def run_fine_tuning() -> None:
     log.info("Fine-tuning complete.  Total hands: %d", hand_count)
 
     for seat, agent in enumerate(agents):
-        _save_agent(agent.network, seat, hand_count, CHECKPOINT_DIR, "perturbed_agent")
+        last_stats = next((item for item in reversed(training_log) if item["seat"] == seat), None)
+        if last_stats:
+            _save_agent(
+                agent.network, seat, hand_count, CHECKPOINT_DIR, "perturbed_agent",
+                last_stats["policy_loss"], last_stats["value_loss"], 
+                last_stats["entropy"], last_stats["kl_penalty"], last_stats["mean_kl"]
+            )
+        else:
+            _save_agent(agent.network, seat, hand_count, CHECKPOINT_DIR, "perturbed_agent")
         log.info("  Saved: checkpoints/perturbed_agent_%d.pt", seat)
 
     params_record = [
@@ -393,11 +412,16 @@ def run_fine_tuning() -> None:
 
 
 def _save_agent(
-    network:  ActorCriticNetwork,
-    seat:     int,
-    step:     int,
-    out_dir:  str,
-    prefix:   str,
+    network:      ActorCriticNetwork,
+    seat:         int,
+    step:         int,
+    out_dir:      str,
+    prefix:       str,
+    policy_loss:  Optional[float] = None,
+    value_loss:   Optional[float] = None,
+    entropy:      Optional[float] = None,
+    kl_penalty:   Optional[float] = None,
+    mean_kl:      Optional[float] = None,
 ) -> None:
     path = os.path.join(out_dir, f"{prefix}_{seat}.pt")
     torch.save({
@@ -409,6 +433,11 @@ def _save_agent(
         "step":          step,
         "alpha":         REWARD_PARAMS[seat].alpha,
         "beta":          REWARD_PARAMS[seat].beta,
+        "policy_loss":   policy_loss,
+        "value_loss":    value_loss,
+        "entropy":       entropy,
+        "kl_penalty":    kl_penalty,
+        "mean_kl":       mean_kl,
     }, path)
 
 
