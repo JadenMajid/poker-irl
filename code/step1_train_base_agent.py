@@ -66,7 +66,7 @@ from reward import NeutralRewardParams, RewardFunction
 CHECKPOINT_DIR   = "checkpoints"
 LOG_EVERY        = 500       # hands between progress logs
 SAVE_EVERY       = 10_000    # hands between intermediate saves
-MAX_HANDS        = 2_000_000 # hard ceiling (~1–2 days on CPU)
+MAX_HANDS        = 4_000_000 # hard ceiling (~1–2 days on CPU)
 DEVICE           = "cpu"     # change to "cuda" if available
 HIDDEN_DIM       = 256
 

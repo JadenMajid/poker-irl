@@ -54,6 +54,7 @@ Output files:
 from __future__ import annotations
 
 import copy
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import json
 import logging
 import os
@@ -92,10 +93,12 @@ from reward import RewardParams, RewardFunction, NeutralRewardParams
 
 CHECKPOINT_DIR = "checkpoints"
 DEVICE         = "cpu"
+TORCH_THREADS  = max(1, int(os.getenv("POKER_TORCH_THREADS", str(os.cpu_count() or 1))))
+PARALLEL_UPDATE_WORKERS = max(1, int(os.getenv("STEP2_PARALLEL_UPDATE_WORKERS", "1")))
 HIDDEN_DIM     = 256
 LOG_EVERY      = 500
 SAVE_EVERY     = 10_000
-MAX_HANDS      = 1_500_000
+MAX_HANDS      = 4_000_000
 
 # ── Reward parameters for each seat ───────────────────────────────────────
 # Calibrated so perturbation ≈ 10–20% of typical hand reward.
@@ -151,6 +154,25 @@ logging.basicConfig(
     datefmt="%H:%M:%S",
 )
 log = logging.getLogger(__name__)
+
+
+def _resolve_device(device_cfg: str) -> str:
+    """Resolve device in priority order for "auto": mps -> cuda -> cpu."""
+    cfg = device_cfg.lower().strip()
+    if cfg != "auto":
+        return cfg
+    if torch.backends.mps.is_available():
+        return "mps"
+    if torch.cuda.is_available():
+        return "cuda"
+    return "cpu"
+
+
+def _format_kl_for_log(detector: ConvergenceDetector) -> str:
+    kl = detector.latest_mean_kl()
+    if np.isfinite(kl):
+        return f"{kl:.5f}"
+    return "warmup"
 
 
 # ---------------------------------------------------------------------------
@@ -230,7 +252,7 @@ class IndependentAgent:
 
     def maybe_update(self) -> Optional[Dict]:
         """Run PPO update if buffer is full enough.  Returns stats dict or None."""
-        if len(self.trainer.buffer) >= FINETUNE_PPO_CFG.n_steps_per_update:
+        if len(self.trainer.buffer) >= self.trainer.cfg.n_steps_per_update:
             self.network.train()
             stats = self.trainer.update()
             self.network.eval()
@@ -249,7 +271,22 @@ class IndependentAgent:
 
 def run_fine_tuning() -> None:
     os.makedirs(CHECKPOINT_DIR, exist_ok=True)
-    device = torch.device(DEVICE)
+    resolved_device = _resolve_device(DEVICE)
+    device = torch.device(resolved_device)
+
+    if device.type == "cpu":
+        # With parallel seat updates, keep per-op thread count bounded to avoid oversubscription.
+        effective_threads = max(1, TORCH_THREADS // PARALLEL_UPDATE_WORKERS)
+        torch.set_num_threads(effective_threads)
+        if hasattr(torch, "set_num_interop_threads"):
+            torch.set_num_interop_threads(min(effective_threads, 8))
+        log.info(
+            "Using CPU with %d torch threads (workers=%d).",
+            torch.get_num_threads(),
+            PARALLEL_UPDATE_WORKERS,
+        )
+    else:
+        log.info("Using %s device.", device.type)
 
     # ── Load base agent ────────────────────────────────────────────────────
     base_path = os.path.join(CHECKPOINT_DIR, "base_agent.pt")
@@ -329,11 +366,37 @@ def run_fine_tuning() -> None:
             agent.anneal_kl()
 
         # PPO updates (each agent updates independently when buffer is ready)
-        for seat, agent in enumerate(agents):
-            if converged[seat]:
-                continue
-            stats = agent.maybe_update()
-            if stats is not None:
+        active_seats = [seat for seat in range(NUM_PLAYERS) if not converged[seat]]
+        if PARALLEL_UPDATE_WORKERS > 1 and len(active_seats) > 1:
+            with ThreadPoolExecutor(max_workers=min(PARALLEL_UPDATE_WORKERS, len(active_seats))) as ex:
+                futures = {ex.submit(agents[seat].maybe_update): seat for seat in active_seats}
+                for fut in as_completed(futures):
+                    seat = futures[fut]
+                    stats = fut.result()
+                    if stats is None:
+                        continue
+                    update_counts[seat] += 1
+                    if update_counts[seat] % 10 == 0:
+                        log.info(
+                            "  Seat %d | Update %3d | π-loss %.4f | entropy %.4f | kl_pen %.4f",
+                            seat, update_counts[seat],
+                            stats["policy_loss"], stats["entropy"], stats["kl_penalty"],
+                        )
+                    training_log.append({
+                        "hand":        hand_count,
+                        "seat":        seat,
+                        "update":      update_counts[seat],
+                        "policy_loss": stats["policy_loss"],
+                        "value_loss":  stats["value_loss"],
+                        "entropy":     stats["entropy"],
+                        "kl_penalty":  stats["kl_penalty"],
+                        "mean_kl":     agents[seat].detector.latest_mean_kl(),
+                    })
+        else:
+            for seat in active_seats:
+                stats = agents[seat].maybe_update()
+                if stats is None:
+                    continue
                 update_counts[seat] += 1
                 if update_counts[seat] % 10 == 0:
                     log.info(
@@ -349,14 +412,14 @@ def run_fine_tuning() -> None:
                     "value_loss":  stats["value_loss"],
                     "entropy":     stats["entropy"],
                     "kl_penalty":  stats["kl_penalty"],
-                    "mean_kl":     agent.detector.latest_mean_kl(),
+                    "mean_kl":     agents[seat].detector.latest_mean_kl(),
                 })
 
         # Progress log
         if hand_count % LOG_EVERY == 0:
             elapsed  = time.time() - start_time
             hands_ph = hand_count / max(elapsed, 1) * 3600
-            kls      = [f"{a.detector.latest_mean_kl():.5f}" for a in agents]
+            kls      = [_format_kl_for_log(a.detector) for a in agents]
             log.info(
                 "Hand %7d | KLs %s | %.0f hands/hr | converged=%s",
                 hand_count, kls, hands_ph, converged,

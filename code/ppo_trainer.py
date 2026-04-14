@@ -471,9 +471,12 @@ class ConvergenceDetector:
         """Call after each hand.  Returns True when convergence is detected."""
         self._hand_count += 1
 
+        # Ensure we always create the first snapshot once warmup is complete
+        # and features are available, even if exact boundary timing is missed.
+        if self._hand_count >= self.min_hands and self._snapshot is None and features is not None:
+            self._snapshot = _clone_params(network)
+
         if self._hand_count < self.min_hands:
-            if self._hand_count == self.min_hands and features is not None:
-                self._snapshot = _clone_params(network)
             return False
 
         if self._hand_count % self.check_every == 0 and features is not None:
