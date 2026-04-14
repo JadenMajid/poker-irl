@@ -27,7 +27,7 @@ from __future__ import annotations
 import logging
 from typing import Callable, Dict, List, Optional, Sequence
 
-from code.cards import Deck, make_deck
+from cards import Deck, make_deck
 from game_state import (
     Action,
     ActionType,

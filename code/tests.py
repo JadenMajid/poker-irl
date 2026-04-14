@@ -24,7 +24,7 @@ import torch
 # Add parent dir to path so we can import from poker_irl/
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
-from code.cards import Card, Rank, Suit, Deck
+from cards import Card, Rank, Suit, Deck
 from hand_evaluator import (
     evaluate_hand, compare_hands, HandCategory, hand_rank_vector
 )
@@ -38,7 +38,7 @@ from reward import (
     RewardParams, RewardFunction, NeutralRewardParams,
     RollingVarianceTracker, compute_reward_stateless, reward_gradient_wrt_params
 )
-from code.agent import (
+from agent import (
     PokerAgent, ActorCriticNetwork, legal_action_mask, make_neutral_agents, make_agent_set, NUM_ACTIONS
 )
 

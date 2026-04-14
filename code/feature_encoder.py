@@ -50,7 +50,7 @@ from typing import List, Optional, Sequence
 
 import numpy as np
 
-from code.cards import Card
+from cards import Card
 from game_state import (
     ActionType,
     NUM_PLAYERS,

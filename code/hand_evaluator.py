@@ -31,7 +31,7 @@ from enum import IntEnum
 from itertools import combinations
 from typing import List, NamedTuple, Sequence, Tuple
 
-from code.cards import Card
+from cards import Card
 
 
 # ---------------------------------------------------------------------------
