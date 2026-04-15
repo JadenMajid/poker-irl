@@ -60,22 +60,19 @@ import logging
 import os
 import sys
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional
 
 import numpy as np
 import torch
-import torch.nn.functional as F
-from torch.distributions import Categorical
+from torch.distributions import Gaussian
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 from agent import (
     ActorCriticNetwork,
-    PokerAgent,
     NUM_ACTIONS,
     index_to_action,
     legal_action_mask,
-    action_to_index,
 )
 from feature_encoder import FeatureEncoder, FEATURE_DIM
 from game_state import NUM_PLAYERS, PlayerObservation, Action
@@ -85,9 +82,8 @@ from ppo_trainer import (
     PPOTrainer,
     ConvergenceDetector,
     FeatureSampleStore,
-    RolloutBuffer,
 )
-from reward import RewardParams, RewardFunction, NeutralRewardParams
+from reward import RewardParams, RewardFunction
 
 # ── configuration ──────────────────────────────────────────────────────────
 
@@ -221,7 +217,7 @@ class IndependentAgent:
 
         with torch.no_grad():
             logits, value = self.network(feat_t, mask_t)
-            dist          = Categorical(logits=logits.squeeze(0))
+            dist          = Gaussian(logits=logits.squeeze(0))
             idx_t         = dist.sample()
             lp            = dist.log_prob(idx_t)
             idx           = int(idx_t.item())

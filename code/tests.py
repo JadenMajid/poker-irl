@@ -122,8 +122,10 @@ def _():
 
 @test("Deck shuffle changes order (statistically)")
 def _():
-    d1 = Deck(); d1.shuffle(seed=42)
-    d2 = Deck(); d2.shuffle(seed=99)
+    d1 = Deck()
+    d1.shuffle(seed=42)
+    d2 = Deck()
+    d2.shuffle(seed=99)
     c1 = d1.deal(10)
     c2 = d2.deal(10)
     # Very unlikely to match in practice
@@ -220,7 +222,7 @@ def _():
         (0, cards("Ah", "Kh")),
         (1, cards("As", "Ks")),
     ]
-    board = cards("Qh", "Jd", "Ts")
+    # board = cards("Qh", "Jd", "Ts")
     # Both have A-K-Q-J-T (broadway straight) → tie
     board_full = cards("Qh", "Jd", "Ts")
     result = compare_hands(hands, board_full)
@@ -376,8 +378,8 @@ print("\n=== Feature Encoder ===")
 @test(f"Encoder output has shape ({FEATURE_DIM},)")
 def _():
     encoder = FeatureEncoder()
-    agents  = make_neutral_agents()
-    env     = make_env_from_agents(agents)
+    # agents  = make_neutral_agents()
+    # env     = make_env_from_agents(agents)
 
     collected_obs = []
     def capture(obs):
@@ -396,8 +398,8 @@ def _():
 @test("Encoder output contains no NaN or Inf")
 def _():
     encoder = FeatureEncoder()
-    agents  = make_neutral_agents()
-    env     = make_env_from_agents(agents)
+    # agents  = make_neutral_agents()
+    # env     = make_env_from_agents(agents)
     obs_list = []
 
     def capture(obs):
@@ -515,7 +517,7 @@ def _():
     import random as pyrandom
     agent  = PokerAgent(seat=0, reward_params=NeutralRewardParams)
     agents = make_neutral_agents()
-    env    = make_env_from_agents(agents)
+    # env    = make_env_from_agents(agents)
     obs_list = []
 
     def capture_and_act(obs):

@@ -45,12 +45,11 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from agent import (
     ActorCriticNetwork,
     NUM_ACTIONS,
-    action_to_index,
     index_to_action,
     legal_action_mask,
 )
 from feature_encoder import FeatureEncoder, FEATURE_DIM
-from game_state import Action, ActionType, NUM_PLAYERS, PlayerObservation
+from game_state import Action, NUM_PLAYERS, PlayerObservation
 from poker_env import PokerEnv
 from ppo_trainer import (
     PPOConfig,
@@ -247,7 +246,7 @@ def run_training() -> None:
     network = ActorCriticNetwork(input_dim=FEATURE_DIM, hidden_dim=HIDDEN_DIM).to(device)
     network.eval()
 
-    agent    = SharedPolicyAgent(network, device)
+    # agent    = SharedPolicyAgent(network, device)
     trainer  = PPOTrainer(network, PPO_CFG, device)
     detector = ConvergenceDetector(
         window=CONV_WINDOW,
@@ -281,7 +280,7 @@ def run_training() -> None:
 
         shared_buffer  = trainer.buffer
         shared_buffer.clear()
-        seat_histories: Dict[int, List] = {i: [] for i in range(NUM_PLAYERS)}
+        # seat_histories: Dict[int, List] = {i: [] for i in range(NUM_PLAYERS)}
         hands_this_rollout = 0
 
         while len(shared_buffer) < PPO_CFG.n_steps_per_update:
@@ -320,7 +319,7 @@ def run_training() -> None:
             # Back-fill rewards: terminal reward for each seat's LAST step,
             # zero for all intermediate steps.
             for seat in range(NUM_PLAYERS):
-                chip_delta = float(traj.final_chip_deltas.get(seat, 0))
+                # chip_delta = float(traj.final_chip_deltas.get(seat, 0))
                 rf_components = reward_fns[seat].compute(traj, seat)
                 terminal_reward = rf_components.total   # neutral: == chip_delta
 
