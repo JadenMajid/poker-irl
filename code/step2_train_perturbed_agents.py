@@ -217,7 +217,7 @@ class IndependentAgent:
 
         with torch.no_grad():
             logits, value = self.network(feat_t, mask_t)
-            dist          = Uniform(-1, 1)
+            dist          = Categorical(logits=logits.squeeze(0))
             idx_t         = dist.sample()
             lp            = dist.log_prob(idx_t)
             idx           = int(idx_t.item())
