@@ -64,7 +64,7 @@ from typing import Dict, List, Optional
 
 import numpy as np
 import torch
-from torch.distributions import Gaussian
+from torch.distributions import Categorical, Uniform
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
@@ -93,8 +93,8 @@ TORCH_THREADS  = max(1, int(os.getenv("POKER_TORCH_THREADS", str(os.cpu_count() 
 PARALLEL_UPDATE_WORKERS = max(1, int(os.getenv("STEP2_PARALLEL_UPDATE_WORKERS", "1")))
 HIDDEN_DIM     = 256
 LOG_EVERY      = 500
-SAVE_EVERY     = 10_000
-MAX_HANDS      = 4_000_000
+SAVE_EVERY     = 50_000
+MAX_HANDS      = 1_000_000
 
 # ── Reward parameters for each seat ───────────────────────────────────────
 # Calibrated so perturbation ≈ 10–20% of typical hand reward.
@@ -121,7 +121,7 @@ FINETUNE_PPO_CFG = PPOConfig(
     value_clip_range=0.15,
     value_coef=0.5,
     entropy_coef=0.005,    # lower entropy encourages specialisation
-    kl_coef=0.05,          # initial KL penalty (annealed below)
+    kl_coef=0.01,          # initial KL penalty (annealed below)
     gae_lambda=0.95,
     gamma=1.0,
     learning_rate=1e-4,    # smaller than base training
@@ -217,7 +217,7 @@ class IndependentAgent:
 
         with torch.no_grad():
             logits, value = self.network(feat_t, mask_t)
-            dist          = Gaussian(logits=logits.squeeze(0))
+            dist          = Uniform(-1, 1)
             idx_t         = dist.sample()
             lp            = dist.log_prob(idx_t)
             idx           = int(idx_t.item())
