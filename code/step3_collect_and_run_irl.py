@@ -76,11 +76,13 @@ from __future__ import annotations
 
 import json
 import logging
+import multiprocessing as mp
 import os
 import pickle
 import sys
 import time
 from collections import defaultdict
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Tuple
 
@@ -123,6 +125,16 @@ HIDDEN_DIM     = 256
 N_COLLECTION_HANDS = 50_000
 LOG_COLLECT_EVERY  = 5_000
 
+# Number of parallel worker processes for trajectory collection.
+# Each worker simulates an independent slice of hands with its own network
+# copies — no shared state.  Speedup is near-linear with core count.
+# Set to 1 to disable and use the original serial path.
+N_COLLECT_WORKERS: int = min(4, os.cpu_count() or 1)
+
+# Number of parallel workers for opponent BC training and per-seat IRL.
+# BC models and IRL runs are fully independent across seats.
+N_IRL_WORKERS: int = min(4, os.cpu_count() or 1)
+
 # Opponent modelling (behavioural cloning)
 OPP_HIDDEN_DIM  = 128
 OPP_EPOCHS      = 50
@@ -137,6 +149,19 @@ IRL_BATCH_SIZE  = 256       # hands sampled per gradient step
 IRL_PRIOR_SIGMA = 1.0       # Gaussian prior std (in normalised space)
 IRL_GRAD_CLIP   = 5.0       # gradient norm clip for stability
 IRL_LOG_EVERY   = 100
+
+# Gradient accumulation for IRL parameter smoothing
+# ---------------------------------------------------
+# Rather than applying an Adam step after every single sampled batch,
+# we accumulate gradients over IRL_GRAD_ACCUM_STEPS batches and average
+# them before the optimiser update.  This is the IRL analogue of PPO
+# mini-batching: more data per effective gradient step → lower variance
+# on the (α̂, β̂) trendlines without changing the total number of
+# forward passes or the learning rate schedule.
+#
+# Effective batch size = IRL_BATCH_SIZE × IRL_GRAD_ACCUM_STEPS hands.
+# Set to 1 to restore the original single-step behaviour.
+IRL_GRAD_ACCUM_STEPS: int = 4
 
 # Convergence (gradient steps)
 CONV_WINDOW     = 300
@@ -189,57 +214,53 @@ class HandRecord:
 # Trajectory collector
 # ---------------------------------------------------------------------------
 
-def collect_trajectories(
-    n_hands:        int,
-    agent_paths:    Optional[Dict[int, str]] = None,
+def _collect_hand_chunk(
+    chunk_start:  int,
+    chunk_size:   int,
+    agent_paths:  Dict[int, str],
+    device_str:   str,
 ) -> List[HandRecord]:
     """
-    Load all 4 perturbed agents (frozen), simulate n_hands, collect HandRecords.
+    Worker function: simulate ``chunk_size`` hands and return HandRecords.
+    hand_id values are offset by chunk_start so they remain globally unique
+    after the main process concatenates all chunks.
 
-    Parameters
-    ----------
-    n_hands      : Number of hands to play.
-    agent_paths  : Optional override of {seat: checkpoint_path}.  If None,
-                   defaults to checkpoints/perturbed_agent_{seat}.pt for all seats.
+    Receives only picklable plain values; returns picklable HandRecord objects
+    (which contain numpy arrays and Python scalars).
     """
-    device  = torch.device(DEVICE)
-    encoder = FeatureEncoder()
+    import torch as _torch
+    _torch.set_num_threads(1)   # one thread per worker avoids oversubscription
 
-    if agent_paths is None:
-        agent_paths = {
-            i: os.path.join(CHECKPOINT_DIR, f"perturbed_agent_{i}.pt")
-            for i in range(NUM_PLAYERS)
-        }
+    _device  = _torch.device(device_str)
+    _encoder = FeatureEncoder()
+    _networks: Dict[int, ActorCriticNetwork] = {}
 
-    networks: Dict[int, ActorCriticNetwork] = {}
     for seat, path in agent_paths.items():
-        if not os.path.exists(path):
-            raise FileNotFoundError(f"Agent checkpoint not found: {path}")
-        ckpt = torch.load(path, map_location=device)
-        net  = ActorCriticNetwork(
-            input_dim=ckpt.get("feature_dim", FEATURE_DIM),
-            hidden_dim=ckpt.get("hidden_dim",  HIDDEN_DIM),
-        ).to(device)
-        net.load_state_dict(ckpt["network_state"])
+        _ckpt = _torch.load(path, map_location=_device)
+        net   = ActorCriticNetwork(
+            input_dim=_ckpt.get("feature_dim", FEATURE_DIM),
+            hidden_dim=_ckpt.get("hidden_dim",  HIDDEN_DIM),
+        ).to(_device)
+        net.load_state_dict(_ckpt["network_state"])
         net.eval()
         for p in net.parameters():
             p.requires_grad_(False)
-        networks[seat] = net
+        _networks[seat] = net
 
     records: List[HandRecord] = []
-    start = time.time()
 
-    for hand_i in range(n_hands):
+    for local_i in range(chunk_size):
+        hand_id    = chunk_start + local_i
         hand_steps: Dict[int, List] = {i: [] for i in range(NUM_PLAYERS)}
 
         def make_cb(seat: int, net: ActorCriticNetwork):
             def callback(obs: PlayerObservation) -> Action:
-                feat   = encoder.encode(obs)
+                feat   = _encoder.encode(obs)
                 mask   = legal_action_mask(obs)
-                feat_t = torch.tensor(feat, dtype=torch.float32,
-                                      device=device).unsqueeze(0)
-                mask_t = mask.unsqueeze(0).to(device)
-                with torch.no_grad():
+                feat_t = _torch.tensor(feat, dtype=_torch.float32,
+                                       device=_device).unsqueeze(0)
+                mask_t = mask.unsqueeze(0).to(_device)
+                with _torch.no_grad():
                     logits, _ = net(feat_t, mask_t)
                     dist      = Categorical(logits=logits.squeeze(0))
                     idx       = int(dist.sample().item())
@@ -249,7 +270,7 @@ def collect_trajectories(
             return callback
 
         env  = PokerEnv(
-            [make_cb(i, networks[i]) for i in range(NUM_PLAYERS)],
+            [make_cb(i, _networks[i]) for i in range(NUM_PLAYERS)],
             record_trajectories=True,
         )
         traj = env.play_hand()
@@ -260,12 +281,12 @@ def collect_trajectories(
         }
         max_pots: Dict[int, float] = {}
         for seat in range(NUM_PLAYERS):
-            mp = 0.0
+            mp_val = 0.0
             for step in traj.steps:
                 if step.acting_seat == seat:
                     if step.action.action_type in (ActionType.CALL, ActionType.RAISE):
-                        mp = max(mp, float(step.observation.pot))
-            max_pots[seat] = mp
+                        mp_val = max(mp_val, float(step.observation.pot))
+            max_pots[seat] = mp_val
 
         steps_by_seat: Dict[int, List[StepRecord]] = {i: [] for i in range(NUM_PLAYERS)}
         for seat in range(NUM_PLAYERS):
@@ -279,26 +300,96 @@ def collect_trajectories(
                     action_idx=idx,
                     legal_mask=mask_np,
                     reward_chip=chip_deltas[seat] if is_last else 0.0,
-                    reward_var_pen=0.0,      # filled after rolling var computed
+                    reward_var_pen=0.0,
                     reward_pot=(max_pots[seat] / POT_NORM) if is_last else 0.0,
                     is_terminal=is_last,
-                    hand_id=hand_i,
+                    hand_id=hand_id,
                 ))
 
         records.append(HandRecord(
-            hand_id=hand_i,
+            hand_id=hand_id,
             steps=steps_by_seat,
             chip_deltas=chip_deltas,
             max_pots=max_pots,
         ))
 
-        if (hand_i + 1) % LOG_COLLECT_EVERY == 0:
-            elapsed  = time.time() - start
-            hands_ph = (hand_i + 1) / max(elapsed, 1) * 3600
-            log.info("  Collected %6d / %6d hands | %.0f hands/hr",
-                     hand_i + 1, n_hands, hands_ph)
-
     return records
+
+
+def collect_trajectories(
+    n_hands:        int,
+    agent_paths:    Optional[Dict[int, str]] = None,
+) -> List[HandRecord]:
+    """
+    Load all 4 perturbed agents (frozen), simulate n_hands, collect HandRecords.
+
+    Hands are split evenly across N_COLLECT_WORKERS worker processes.  Each
+    worker loads its own network copies from the checkpoint files and simulates
+    its slice entirely independently.  The main process concatenates results
+    and re-sorts by hand_id.
+
+    Parameters
+    ----------
+    n_hands      : Number of hands to play.
+    agent_paths  : Optional override of {seat: checkpoint_path}.  If None,
+                   defaults to checkpoints/perturbed_agent_{seat}.pt for all seats.
+    """
+    if agent_paths is None:
+        agent_paths = {
+            i: os.path.join(CHECKPOINT_DIR, f"perturbed_agent_{i}.pt")
+            for i in range(NUM_PLAYERS)
+        }
+    for path in agent_paths.values():
+        if not os.path.exists(path):
+            raise FileNotFoundError(f"Agent checkpoint not found: {path}")
+
+    n_workers  = N_COLLECT_WORKERS
+    chunk_size = (n_hands + n_workers - 1) // n_workers   # ceiling division
+    start      = time.time()
+
+    log.info(
+        "  Collecting %d hands across %d worker(s) (%d hands/worker) ...",
+        n_hands, n_workers, chunk_size,
+    )
+
+    if n_workers == 1:
+        # Serial fast-path avoids process spawn overhead for small datasets
+        records = _collect_hand_chunk(0, n_hands, agent_paths, DEVICE)
+        elapsed  = time.time() - start
+        log.info("  Collected %d hands in %.1fs.", n_hands, elapsed)
+        return records
+
+    mp_ctx   = mp.get_context("spawn")
+    all_records: List[HandRecord] = []
+
+    with ProcessPoolExecutor(max_workers=n_workers, mp_context=mp_ctx) as pool:
+        futures = {}
+        for w in range(n_workers):
+            c_start = w * chunk_size
+            c_size  = min(chunk_size, n_hands - c_start)
+            if c_size <= 0:
+                break
+            fut = pool.submit(_collect_hand_chunk, c_start, c_size, agent_paths, DEVICE)
+            futures[fut] = (w, c_start, c_size)
+
+        completed = 0
+        for fut in as_completed(futures):
+            w, c_start, c_size = futures[fut]
+            chunk = fut.result()
+            all_records.extend(chunk)
+            completed += c_size
+            elapsed   = time.time() - start
+            hands_ph  = completed / max(elapsed, 1) * 3600
+            log.info(
+                "  Worker %d done: %d hands | total %d/%d | %.0f hands/hr",
+                w, c_size, completed, n_hands, hands_ph,
+            )
+
+    # Sort by hand_id to restore deterministic ordering
+    all_records.sort(key=lambda r: r.hand_id)
+    elapsed = time.time() - start
+    log.info("  Collection complete: %d hands in %.1fs.", len(all_records), elapsed)
+    return all_records
 
 
 # ---------------------------------------------------------------------------
@@ -468,9 +559,75 @@ def train_opponent_model(
     return model
 
 
-# ---------------------------------------------------------------------------
-# IRL optimiser with normalised gradients
-# ---------------------------------------------------------------------------
+def _train_opp_model_worker(
+    target_seat: int,
+    opp_seat:    int,
+    features:    np.ndarray,
+    masks:       np.ndarray,
+    actions:     np.ndarray,
+    device_str:  str,
+) -> Tuple[int, int, Dict]:
+    """
+    Picklable wrapper around train_opponent_model for ProcessPoolExecutor.
+    Returns (target_seat, opp_seat, state_dict) so the caller can key results.
+    """
+    import torch as _torch
+    _torch.set_num_threads(1)
+    _device = _torch.device(device_str)
+    model   = train_opponent_model(features, masks, actions, _device)
+    return target_seat, opp_seat, model.state_dict()
+
+
+def _run_irl_worker(
+    target_seat:          int,
+    step_data:            List[Tuple],
+    opp_state_dicts:      Dict[int, Dict],
+    target_net_state_dict: Dict,
+    net_input_dim:        int,
+    net_hidden_dim:       int,
+    device_str:           str,
+    true_alpha:           float,
+    true_beta:            float,
+    var_norm:             float,
+) -> Dict:
+    """
+    Picklable wrapper around run_irl_for_seat for ProcessPoolExecutor.
+
+    Receives network weights as plain state dicts (picklable) rather than
+    live nn.Module objects, rebuilds them inside the worker process, then
+    delegates to run_irl_for_seat.
+    """
+    import torch as _torch
+    _torch.set_num_threads(1)
+    _device = _torch.device(device_str)
+
+    # Rebuild target network
+    target_net = ActorCriticNetwork(
+        input_dim=net_input_dim, hidden_dim=net_hidden_dim
+    ).to(_device)
+    target_net.load_state_dict(target_net_state_dict)
+    target_net.eval()
+    for p in target_net.parameters():
+        p.requires_grad_(False)
+
+    # Rebuild opponent BC models
+    opponent_models: Dict[int, BehaviourCloningNet] = {}
+    for opp_seat, sd in opp_state_dicts.items():
+        opp_net = BehaviourCloningNet().to(_device)
+        opp_net.load_state_dict(sd)
+        opp_net.eval()
+        opponent_models[opp_seat] = opp_net
+
+    return run_irl_for_seat(
+        target_seat=target_seat,
+        step_data=step_data,
+        opponent_models=opponent_models,
+        target_network=target_net,
+        device=_device,
+        true_alpha=true_alpha,
+        true_beta=true_beta,
+        var_norm=var_norm,
+    )
 
 class IRLOptimiser:
     """
@@ -510,14 +667,15 @@ class IRLOptimiser:
 
     def __init__(
         self,
-        target_seat:     int,
-        step_data:       List[Tuple],
-        opponent_models: Dict[int, BehaviourCloningNet],
-        target_network:  ActorCriticNetwork,
-        device:          torch.device,
-        var_norm:        float,
-        prior_sigma:     float = IRL_PRIOR_SIGMA,
-        lr:              float = IRL_LR,
+        target_seat:      int,
+        step_data:        List[Tuple],
+        opponent_models:  Dict[int, BehaviourCloningNet],
+        target_network:   ActorCriticNetwork,
+        device:           torch.device,
+        var_norm:         float,
+        prior_sigma:      float = IRL_PRIOR_SIGMA,
+        lr:               float = IRL_LR,
+        grad_accum_steps: int   = IRL_GRAD_ACCUM_STEPS,
     ) -> None:
         self.seat           = target_seat
         self.step_data      = step_data
@@ -526,6 +684,7 @@ class IRLOptimiser:
         self.device         = device
         self.var_norm       = max(var_norm, 1.0)    # chips²
         self.prior_sigma    = prior_sigma
+        self.grad_accum_steps = max(1, grad_accum_steps)
 
         # Parameters: [alpha, beta] in true parameter space.
         # Variance feature is normalised, so gradients stay well-scaled.
@@ -538,6 +697,13 @@ class IRLOptimiser:
         self.alpha_history: List[float] = []
         self.beta_history:       List[float] = []
         self.ll_history:         List[float] = []
+
+        # Gradient accumulation state
+        # _accum_grad holds the running sum; _accum_ll holds the sum of
+        # mean log-likelihoods across accumulation steps.
+        self._accum_grad: Optional[torch.Tensor] = None
+        self._accum_ll:   float = 0.0
+        self._accum_count: int  = 0
 
         self._precompute_baselines()
 
@@ -648,20 +814,46 @@ class IRLOptimiser:
         return full_grad, ll_mean
 
     def step(self, batch: List[Tuple]) -> float:
-        """One gradient-ascent step.  Returns mean log-likelihood."""
+        """
+        Accumulate one batch's gradient, and — once grad_accum_steps batches
+        have been accumulated — average the gradients and apply a single Adam
+        step.  Returns the mean log-likelihood for this batch (not the
+        accumulated average), so the caller's logging cadence is unaffected.
+
+        When grad_accum_steps == 1 this is identical to the original
+        single-step behaviour.
+        """
         full_grad, ll = self._compute_gradient(batch)
 
-        self.optimiser.zero_grad()
-        # We maximise, so set gradient for minimiser as negative of ascent gradient
-        self.theta.grad = (-full_grad).to(dtype=self.theta.dtype)
-        self.optimiser.step()
+        # Accumulate
+        if self._accum_grad is None:
+            self._accum_grad = full_grad.clone()
+        else:
+            self._accum_grad += full_grad
+        self._accum_ll    += ll
+        self._accum_count += 1
 
-        # Record in true parameter space
-        alpha_v = float(self.theta[0].item())
-        beta_v  = float(self.theta[1].item())
-        self.alpha_history.append(alpha_v)
-        self.beta_history.append(beta_v)
-        self.ll_history.append(ll)
+        if self._accum_count >= self.grad_accum_steps:
+            # Average across accumulation steps and apply the optimiser
+            avg_grad = self._accum_grad / self._accum_count
+            avg_ll   = self._accum_ll   / self._accum_count
+
+            self.optimiser.zero_grad()
+            # We maximise, so pass the negated gradient to the minimiser
+            self.theta.grad = (-avg_grad).to(dtype=self.theta.dtype)
+            self.optimiser.step()
+
+            # Record the post-step parameter values
+            alpha_n = float(self.theta[0].item())
+            beta_v  = float(self.theta[1].item())
+            self.alpha_norm_history.append(alpha_n)
+            self.beta_history.append(beta_v)
+            self.ll_history.append(avg_ll)
+
+            # Reset accumulator
+            self._accum_grad  = None
+            self._accum_ll    = 0.0
+            self._accum_count = 0
 
         return ll
 
@@ -727,8 +919,10 @@ def run_irl_for_seat(
     """
     log.info("  Running IRL for seat %d (true α=%.5f, true β=%.4f)",
              target_seat, true_alpha, true_beta)
-    log.info("    Data: %d hands  |  VAR_NORM=%.0f  |  LR=%.4f",
-             len(step_data), var_norm, IRL_LR)
+    log.info("    Data: %d hands  |  VAR_NORM=%.0f  |  LR=%.4f  |  "
+             "grad_accum=%d (eff. batch=%d hands)",
+             len(step_data), var_norm, IRL_LR,
+             IRL_GRAD_ACCUM_STEPS, IRL_BATCH_SIZE * IRL_GRAD_ACCUM_STEPS)
 
     if not step_data:
         log.warning("    No data for seat %d — skipping.", target_seat)
@@ -864,14 +1058,12 @@ def run_collection_and_irl(
                         if true_params[s] != (0.0, 0.0)]
         log.info("Ablation: running IRL on seats %s only.", seats_to_run)
 
-    irl_results = []
+    # ── 2a: Load all target networks (needed for both BC and IRL) ─────────
+    target_networks: Dict[int, ActorCriticNetwork] = {}
+    target_net_sdicts: Dict[int, Dict]              = {}
+    target_net_dims:   Dict[int, Tuple[int, int]]   = {}
 
     for target_seat in seats_to_run:
-        log.info("\n" + "=" * 62)
-        log.info("IRL — Target seat %d", target_seat)
-        log.info("=" * 62)
-
-        # Load target network
         if is_ablation:
             agent_path = os.path.join(CHECKPOINT_DIR, "ablation_perturbed_agent_0.pt")
         elif agent_paths and target_seat in agent_paths:
@@ -884,55 +1076,120 @@ def run_collection_and_irl(
             continue
 
         ckpt = torch.load(agent_path, map_location=device)
-        target_net = ActorCriticNetwork(
+        net  = ActorCriticNetwork(
             input_dim=ckpt.get("feature_dim", FEATURE_DIM),
             hidden_dim=ckpt.get("hidden_dim",  HIDDEN_DIM),
         ).to(device)
-        target_net.load_state_dict(ckpt["network_state"])
-        target_net.eval()
-        for p in target_net.parameters():
+        net.load_state_dict(ckpt["network_state"])
+        net.eval()
+        for p in net.parameters():
             p.requires_grad_(False)
+        target_networks[target_seat]   = net
+        target_net_sdicts[target_seat] = ckpt["network_state"]
+        target_net_dims[target_seat]   = (
+            ckpt.get("feature_dim", FEATURE_DIM),
+            ckpt.get("hidden_dim",  HIDDEN_DIM),
+        )
 
-        # Train opponent models from the other seats
-        opponent_models: Dict[int, BehaviourCloningNet] = {}
+    # ── 2b: Train all opponent BC models in parallel ───────────────────────
+    # For each target seat we need BC models for the other 3 seats.
+    # All (target_seat, opp_seat) pairs are independent — submit them all.
+    log.info(
+        "Training opponent BC models in parallel (N_IRL_WORKERS=%d) ...",
+        N_IRL_WORKERS,
+    )
+    mp_ctx = mp.get_context("spawn")
+
+    # Collected state dicts: opp_sdicts[target_seat][opp_seat] = state_dict
+    opp_sdicts: Dict[int, Dict[int, Dict]] = {s: {} for s in seats_to_run}
+
+    bc_jobs: List[Tuple] = []
+    for target_seat in seats_to_run:
         for opp_seat in range(NUM_PLAYERS):
             if opp_seat == target_seat:
                 continue
-            opp_data = mc_data[opp_seat]
+            opp_data = mc_data.get(opp_seat, [])
             if len(opp_data) < OPP_MIN_SAMPLES:
-                log.warning("  Too few samples (%d) for opponent model seat %d — skipping.",
-                            len(opp_data), opp_seat)
+                log.warning(
+                    "  Too few samples (%d) for opponent model seat %d — skipping.",
+                    len(opp_data), opp_seat,
+                )
                 continue
-
-            log.info("  Training opponent model — seat %d (%d hands) ...",
-                     opp_seat, len(opp_data))
             all_feats = np.concatenate([d[0] for d in opp_data])
             all_masks = np.concatenate([d[1] for d in opp_data])
             all_acts  = np.concatenate([d[2] for d in opp_data])
+            bc_jobs.append((target_seat, opp_seat, all_feats, all_masks, all_acts))
 
-            opp_net = train_opponent_model(all_feats, all_masks, all_acts, device)
-            opponent_models[opp_seat] = opp_net
-
+    with ProcessPoolExecutor(max_workers=N_IRL_WORKERS, mp_context=mp_ctx) as pool:
+        bc_futures = {
+            pool.submit(
+                _train_opp_model_worker,
+                ts, os_, feats, masks, acts, DEVICE,
+            ): (ts, os_)
+            for ts, os_, feats, masks, acts in bc_jobs
+        }
+        for fut in as_completed(bc_futures):
+            ts, os_   = bc_futures[fut]
+            ts_r, os_r, sd = fut.result()
+            opp_sdicts[ts_r][os_r] = sd
+            # Save the opponent model
             opp_save = os.path.join(
                 IRL_DIR,
-                f"opp_model_target{target_seat}_opp{opp_seat}{suffix}.pt"
+                f"opp_model_target{ts_r}_opp{os_r}{suffix}.pt"
             )
-            torch.save(opp_net.state_dict(), opp_save)
-            log.info("    Saved → %s", opp_save)
+            torch.save(sd, opp_save)
+            log.info(
+                "  BC model done: target_seat=%d opp_seat=%d → %s",
+                ts_r, os_r, opp_save,
+            )
 
-        # Run IRL
-        true_alpha, true_beta = true_params[target_seat]
-        result = run_irl_for_seat(
-            target_seat=target_seat,
-            step_data=mc_data[target_seat],
-            opponent_models=opponent_models,
-            target_network=target_net,
-            device=device,
-            true_alpha=true_alpha,
-            true_beta=true_beta,
-            var_norm=var_std[target_seat],
-        )
-        irl_results.append(result)
+    # ── 2c: Run all per-seat IRL optimisers in parallel ───────────────────
+    log.info(
+        "Running IRL for %d seat(s) in parallel (N_IRL_WORKERS=%d) ...",
+        len(seats_to_run), N_IRL_WORKERS,
+    )
+
+    irl_results = []
+    with ProcessPoolExecutor(max_workers=N_IRL_WORKERS, mp_context=mp_ctx) as pool:
+        irl_futures = {}
+        for target_seat in seats_to_run:
+            if target_seat not in target_net_sdicts:
+                continue   # checkpoint was missing — skipped above
+            inp_dim, hid_dim = target_net_dims[target_seat]
+            true_alpha, true_beta = true_params[target_seat]
+
+            log.info("\n" + "=" * 62)
+            log.info("IRL — submitting seat %d to worker pool", target_seat)
+            log.info("=" * 62)
+
+            fut = pool.submit(
+                _run_irl_worker,
+                target_seat,
+                mc_data[target_seat],
+                opp_sdicts[target_seat],
+                target_net_sdicts[target_seat],
+                inp_dim,
+                hid_dim,
+                DEVICE,
+                true_alpha,
+                true_beta,
+                var_std[target_seat],
+            )
+            irl_futures[fut] = target_seat
+
+        for fut in as_completed(irl_futures):
+            target_seat = irl_futures[fut]
+            result      = fut.result()
+            irl_results.append(result)
+            log.info(
+                "  IRL done: seat %d  α̂=%+.5f  β̂=%+.4f",
+                target_seat,
+                result.get("est_alpha", float("nan")),
+                result.get("est_beta",  float("nan")),
+            )
+
+    # Keep results in seat order for consistent output
+    irl_results.sort(key=lambda r: r.get("seat", 0))
 
     # ── Save results ───────────────────────────────────────────────────────
     # Summary (no full histories — those go in convergence log)
@@ -971,5 +1228,6 @@ def run_collection_and_irl(
 
 
 # ---------------------------------------------------------------------------
+# Entry point — __main__ guard required for "spawn" multiprocessing context.
 if __name__ == "__main__":
     run_collection_and_irl()
