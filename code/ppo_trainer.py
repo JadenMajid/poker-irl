@@ -383,9 +383,14 @@ class PPOTrainer:
                 if self.ref_network is not None and self.cfg.kl_coef > 0:
                     with torch.no_grad():
                         ref_logits, _ = self.ref_network(feat_b, mask_b)
-                        ref_probs     = F.softmax(ref_logits, dim=-1)
-                    curr_lp = F.log_softmax(logits, dim=-1)
-                    kl_pen  = F.kl_div(curr_lp, ref_probs, reduction="batchmean")
+                        ref_logp      = F.log_softmax(ref_logits, dim=-1)
+                        ref_probs     = ref_logp.exp()
+                    curr_logp = F.log_softmax(logits, dim=-1)
+                    # Use explicit KL form and scrub 0*inf terms from masked actions.
+                    kl_terms = ref_probs * (ref_logp - curr_logp)
+                    kl_pen   = torch.nan_to_num(
+                        kl_terms, nan=0.0, posinf=0.0, neginf=0.0
+                    ).sum(dim=-1).mean()
 
                 loss = (
                     policy_loss
@@ -529,9 +534,13 @@ def _kl_between_snapshots(
     with torch.no_grad():
         curr_logits, _ = current(features)
         snap_logits, _ = snap_net(features)
-        curr_lp   = F.log_softmax(curr_logits, dim=-1)
-        snap_prob = F.softmax(snap_logits, dim=-1)
-        kl        = F.kl_div(curr_lp, snap_prob, reduction="batchmean")
+        curr_logp = F.log_softmax(curr_logits, dim=-1)
+        snap_logp = F.log_softmax(snap_logits, dim=-1)
+        snap_prob = snap_logp.exp()
+        kl_terms  = snap_prob * (snap_logp - curr_logp)
+        kl        = torch.nan_to_num(
+            kl_terms, nan=0.0, posinf=0.0, neginf=0.0
+        ).sum(dim=-1).mean()
 
     return float(kl.item())
 

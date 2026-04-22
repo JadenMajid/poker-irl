@@ -364,7 +364,7 @@ def run_ablation_training() -> None:
 
 
 def _save_agent(network: ActorCriticNetwork, step: int, final: bool = False) -> None:
-    name = "ablation_perturbed_agent_0.pt" if final else f"ablation_ckpt_step{step}.pt"
+    name = "ablation_perturbed_agent_0.pt" if final else "ablation_ckpt.pt"
     path = os.path.join(CHECKPOINT_DIR, name)
     torch.save({
         "network_state": network.state_dict(),

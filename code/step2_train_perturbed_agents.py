@@ -105,6 +105,11 @@ REWARD_PARAMS = [
     RewardParams(alpha=+0.004, beta=-0.20),   # Seat 1: risk-averse, pot-avoidant
     RewardParams(alpha=-0.003, beta=+0.25),   # Seat 2: risk-seeking, pot-hungry
     RewardParams(alpha=-0.003, beta=-0.20),   # Seat 3: risk-seeking, pot-avoidant
+
+    # RewardParams(alpha=+0.00, beta=+0.0),   
+    # RewardParams(alpha=+0.00, beta=-0.0),   
+    # RewardParams(alpha=-0.00, beta=+0.0),   
+    # RewardParams(alpha=-0.00, beta=-0.0),   
 ]
 
 # Note: negative alpha is unusual but correct for "risk-seeking" agents.

@@ -131,7 +131,7 @@ OPP_BATCH_SIZE  = 512
 OPP_MIN_SAMPLES = 200
 
 # IRL gradient ascent
-IRL_LR          = 0.02      # LR for (alpha_norm, beta) in normalised space
+IRL_LR          = 0.02      # LR for (alpha, beta)
 IRL_N_STEPS     = 5_000     # max gradient steps per agent
 IRL_BATCH_SIZE  = 256       # hands sampled per gradient step
 IRL_PRIOR_SIGMA = 1.0       # Gaussian prior std (in normalised space)
@@ -476,16 +476,13 @@ class IRLOptimiser:
     """
     Gradient-ascent Bayesian IRL for recovering (alpha, beta) of one target seat.
 
-    Reparametrisation for numerical stability
-    -----------------------------------------
-    We optimise (alpha_norm, beta) where:
+    Parameterisation for numerical stability
+    ----------------------------------------
+    We optimise (alpha, beta) directly, but with a normalised variance feature:
 
-        alpha_norm = alpha_true × VAR_NORM
+        A_var_norm = (rolling_var - V_var) / VAR_NORM
 
-    This keeps both gradient components on the same O(0.1–1.0) scale.
-    After optimisation, recover:
-
-        alpha_true = alpha_norm / VAR_NORM
+    so alpha remains in true units while the feature scale is O(1).
 
     VAR_NORM is computed per-dataset as the standard deviation of the rolling
     variance series, making it adaptive to the actual chip volatility.
@@ -495,19 +492,19 @@ class IRLOptimiser:
     For each hand's terminal step (s_T, a_T):
 
         Q_θ(s_T, a_obs) = Q₀(s_T, a_obs)
-                        + alpha_norm × A_var_norm(s_T)
-                        + beta       × A_pot(s_T)
+                + alpha × A_var_norm(s_T)
+                + beta  × A_pot(s_T)
 
-    where:
-        A_var_norm = (rolling_var - V_var) / VAR_NORM   ∈ O(-1, 1)
-        A_pot      = (pot/POT_NORM) - V_pot             ∈ O(-1, 1)
+    where both features are O(-1, 1):
+        A_var_norm = (rolling_var - V_var) / VAR_NORM
+        A_pot      = (pot/POT_NORM) - V_pot
 
     Log-likelihood gradient (feature expectation matching):
-        ∂ℒ/∂alpha_norm = A_var_norm × (1 - π_θ(a_obs|s))
+        ∂ℒ/∂alpha      = A_var_norm × (1 - π_θ(a_obs|s))
         ∂ℒ/∂beta       = A_pot      × (1 - π_θ(a_obs|s))
 
-    Gaussian prior (in normalised space):
-        ∂log p(θ)/∂alpha_norm = -alpha_norm / σ²
+    Gaussian prior:
+        ∂log p(θ)/∂alpha      = -alpha / σ²
         ∂log p(θ)/∂beta       = -beta       / σ²
     """
 
@@ -530,15 +527,15 @@ class IRLOptimiser:
         self.var_norm       = max(var_norm, 1.0)    # chips²
         self.prior_sigma    = prior_sigma
 
-        # Parameters: [alpha_norm, beta] — both O(1) in normalised space
-        # Initialised at zero (prior centre)
+        # Parameters: [alpha, beta] in true parameter space.
+        # Variance feature is normalised, so gradients stay well-scaled.
         self.theta = nn.Parameter(
             torch.zeros(2, dtype=torch.float64, device=device)
         )
         self.optimiser = Adam([self.theta], lr=lr)
 
-        # History (in normalised space — converted to true scale on readout)
-        self.alpha_norm_history: List[float] = []
+        # History in true parameter space.
+        self.alpha_history: List[float] = []
         self.beta_history:       List[float] = []
         self.ll_history:         List[float] = []
 
@@ -576,12 +573,12 @@ class IRLOptimiser:
 
     def _compute_gradient(self, batch: List[Tuple]) -> Tuple[torch.Tensor, float]:
         """
-        Compute gradient of log p(theta|data) w.r.t. theta = (alpha_norm, beta).
+        Compute gradient of log p(theta|data) w.r.t. theta = (alpha, beta).
 
         Only processes the terminal step of each hand (where reward signal is
         non-zero).  Intermediate steps contribute zero gradient (see docstring).
         """
-        alpha_norm = self.theta[0]   # scalar Parameter, float64
+        alpha = self.theta[0]   # scalar Parameter, float64
         beta       = self.theta[1]
 
         total_ll   = 0.0
@@ -606,8 +603,8 @@ class IRLOptimiser:
             A_pot    = raw_pot  - self.V_pot                      # ∈ O(-1, 1)
 
             # Reward shaping on the observed action
-            #   Q_θ(s, a_obs) = Q₀(s, a_obs) + alpha_norm * A_var_n + beta * A_pot
-            shaping = alpha_norm.item() * A_var_n + beta.item() * A_pot
+            #   Q_θ(s, a_obs) = Q₀(s, a_obs) + alpha * A_var_n + beta * A_pot
+            shaping = alpha.item() * A_var_n + beta.item() * A_pot
 
             adj     = base_logits[0].clone().double()
             adj[a_obs] = adj[a_obs] + shaping
@@ -633,8 +630,8 @@ class IRLOptimiser:
         g_beta  /= n
         ll_mean  = total_ll / n
 
-        # Gaussian prior gradient (in normalised parameter space)
-        prior_g_alpha = -float(alpha_norm.item()) / (self.prior_sigma ** 2)
+        # Gaussian prior gradient
+        prior_g_alpha = -float(alpha.item()) / (self.prior_sigma ** 2)
         prior_g_beta  = -float(beta.item())       / (self.prior_sigma ** 2)
 
         full_grad = torch.tensor(
@@ -659,10 +656,10 @@ class IRLOptimiser:
         self.theta.grad = (-full_grad).to(dtype=self.theta.dtype)
         self.optimiser.step()
 
-        # Record in normalised space
-        alpha_n = float(self.theta[0].item())
+        # Record in true parameter space
+        alpha_v = float(self.theta[0].item())
         beta_v  = float(self.theta[1].item())
-        self.alpha_norm_history.append(alpha_n)
+        self.alpha_history.append(alpha_v)
         self.beta_history.append(beta_v)
         self.ll_history.append(ll)
 
@@ -674,16 +671,15 @@ class IRLOptimiser:
 
     @property
     def current_alpha(self) -> float:
-        """True-scale alpha = alpha_norm / VAR_NORM."""
-        return float(self.theta[0].item()) / self.var_norm
+        return float(self.theta[0].item())
 
     @property
     def current_beta(self) -> float:
         return float(self.theta[1].item())
 
     def mean_alpha_history(self, last_n: int) -> float:
-        h = self.alpha_norm_history[-last_n:]
-        return float(np.mean(h)) / self.var_norm if h else 0.0
+        h = self.alpha_history[-last_n:]
+        return float(np.mean(h)) if h else 0.0
 
     def mean_beta_history(self, last_n: int) -> float:
         h = self.beta_history[-last_n:]
@@ -700,13 +696,13 @@ class IRLOptimiser:
 
     def is_converged(self) -> bool:
         """
-        Converged when the std of BOTH parameters in normalised space over the
+        Converged when the std of BOTH parameters over the
         last CONV_WINDOW steps is below CONV_THRESHOLD.
         This checks stability of the estimate, not proximity to truth.
         """
-        if len(self.alpha_norm_history) < CONV_MIN_STEPS + CONV_WINDOW:
+        if len(self.alpha_history) < CONV_MIN_STEPS + CONV_WINDOW:
             return False
-        std_alpha = float(np.std(self.alpha_norm_history[-CONV_WINDOW:]))
+        std_alpha = float(np.std(self.alpha_history[-CONV_WINDOW:]))
         std_beta  = float(np.std(self.beta_history[-CONV_WINDOW:]))
         return std_alpha < CONV_THRESHOLD and std_beta < CONV_THRESHOLD
 
@@ -778,11 +774,6 @@ def run_irl_for_seat(
         target_seat, final_alpha, true_alpha, final_beta, true_beta,
     )
 
-    # Reconstruct true-scale alpha history for storage
-    true_scale_alpha_history = [
-        a / opt.var_norm for a in opt.alpha_norm_history
-    ]
-
     return {
         "seat":          target_seat,
         "true_alpha":    true_alpha,
@@ -792,9 +783,9 @@ def run_irl_for_seat(
         "alpha_mse":     (final_alpha - true_alpha) ** 2,
         "beta_mse":      (final_beta  - true_beta)  ** 2,
         "var_norm":      var_norm,
-        "n_steps":       len(opt.alpha_norm_history),
+        "n_steps":       len(opt.alpha_history),
         "converged":     opt.is_converged(),
-        "alpha_history": true_scale_alpha_history,   # true-scale for plotting
+        "alpha_history": opt.alpha_history,
         "beta_history":  opt.beta_history,
         "ll_history":    opt.ll_history,
     }
