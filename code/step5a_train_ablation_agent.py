@@ -107,7 +107,7 @@ NORMALISE_BATCH_REWARDS: bool = True
 REWARD_NORM_EPS: float = 1e-8
 
 # Ablation agent reward parameters (matching Seat 0 of main experiment)
-ABLATION_REWARD_PARAMS = RewardParams(alpha=0, beta=0)
+ABLATION_REWARD_PARAMS = RewardParams(alpha=+0.004, beta=+0.25)
 
 # Fine-tuning PPO config (same as step2)
 ABLATION_PPO_CFG = PPOConfig(
