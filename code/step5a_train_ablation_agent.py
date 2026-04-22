@@ -27,6 +27,15 @@ Reward for the ablation agent:
   We use (alpha=+0.004, beta=+0.25) — the same as Seat 0 in the main experiment
   — so the comparison is apples-to-apples.
 
+Mini-batching:
+  Rather than triggering a PPO update whenever the rollout buffer crosses
+  n_steps_per_update transitions, we accumulate HANDS_PER_MINI_BATCH complete
+  hands before each update.  Rewards are normalised across the full batch of
+  hands (zero-mean, unit-variance) before being written into the rollout
+  buffer, which substantially reduces gradient noise and gives the optimiser
+  a smoother loss landscape.  The larger effective batch also improves GPU/CPU
+  utilisation when the environment is the bottleneck.
+
 Output files:
   checkpoints/ablation_perturbed_agent_0.pt    — fine-tuned ablation agent
   checkpoints/ablation_agent_params.json        — (alpha, beta) record
@@ -41,8 +50,10 @@ import logging
 import os
 import sys
 import time
-from typing import Dict, List, Optional
+from dataclasses import dataclass, field
+from typing import Dict, List, Optional, Tuple
 
+import numpy as np
 import torch
 import torch.nn.functional as F
 from torch.distributions import Categorical
@@ -77,8 +88,26 @@ LOG_EVERY      = 500
 SAVE_EVERY     = 10_000
 MAX_HANDS      = 1_000_000
 
+# Number of complete hands to accumulate before each PPO update.
+# Larger values → lower gradient variance, smoother trendlines, but less
+# frequent parameter updates.  A value of 16–32 hands is a good default for
+# a 4-player poker environment where hands average ~6 decision points each,
+# giving ~100–200 transitions per update — comparable to the original
+# n_steps_per_update=2048 but now aligned to hand boundaries.
+HANDS_PER_MINI_BATCH: int = 24
+
+# When True, rewards within each mini-batch are standardised to zero mean /
+# unit variance before being stored in the rollout buffer.  This is the
+# primary mechanism for noise reduction: it prevents a single high-variance
+# hand (e.g. a big pot) from dominating the gradient signal.
+NORMALISE_BATCH_REWARDS: bool = True
+
+# Floor standard-deviation used during reward normalisation to avoid
+# division-by-zero on degenerate batches where all rewards are identical.
+REWARD_NORM_EPS: float = 1e-8
+
 # Ablation agent reward parameters (matching Seat 0 of main experiment)
-ABLATION_REWARD_PARAMS = RewardParams(alpha=+0.004, beta=+0.25)
+ABLATION_REWARD_PARAMS = RewardParams(alpha=0, beta=0)
 
 # Fine-tuning PPO config (same as step2)
 ABLATION_PPO_CFG = PPOConfig(
@@ -119,6 +148,35 @@ log = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
+# Pending hand: holds one complete hand's transitions before batch commit
+# ---------------------------------------------------------------------------
+
+@dataclass
+class PendingHand:
+    """
+    Accumulates all (feature, mask, action, log_prob, value) tuples for a
+    single hand, along with the terminal reward.  Kept separate from the
+    RolloutBuffer so that batch-level reward normalisation can be applied
+    across all pending hands before anything is written to the buffer.
+    """
+    transitions: List[Tuple] = field(default_factory=list)
+    terminal_reward: float   = 0.0
+
+    def add_transition(
+        self,
+        feat:    np.ndarray,
+        mask:    np.ndarray,
+        action:  int,
+        log_prob: float,
+        value:   float,
+    ) -> None:
+        self.transitions.append((feat, mask, action, log_prob, value))
+
+    def __len__(self) -> int:
+        return len(self.transitions)
+
+
+# ---------------------------------------------------------------------------
 # Fixed-policy agent (frozen neutral opponents)
 # ---------------------------------------------------------------------------
 
@@ -144,11 +202,27 @@ class FixedAgent:
 
 
 # ---------------------------------------------------------------------------
-# Training agent (single adaptive agent)
+# Training agent (single adaptive agent, mini-batch aware)
 # ---------------------------------------------------------------------------
 
 class AdaptiveAgent:
-    """Single fine-tuned agent."""
+    """
+    Single fine-tuned agent with mini-batch hand accumulation.
+
+    Instead of writing each hand directly into the RolloutBuffer and
+    triggering an update whenever the buffer is full, this agent accumulates
+    complete hands in a local ``pending_hands`` list.  Once
+    ``HANDS_PER_MINI_BATCH`` hands have been collected the agent:
+
+      1. Optionally normalises rewards across the batch (zero-mean /
+         unit-variance), smoothing the gradient signal.
+      2. Writes all transitions into the RolloutBuffer in one pass.
+      3. Triggers a PPO update if the buffer now meets the step threshold.
+
+    This decouples update frequency from individual hand length, eliminates
+    the per-hand reward spike problem, and makes it straightforward to
+    parallelise hand generation in future (each worker returns a PendingHand).
+    """
 
     def __init__(
         self,
@@ -172,12 +246,22 @@ class AdaptiveAgent:
             check_every=CONV_CHECK_EVERY,
         )
         self.feat_store = FeatureSampleStore(capacity=1024)
-        self._hand_history: List = []
+
+        # Mini-batch accumulator: list of complete PendingHand objects
+        self._pending_hands: List[PendingHand] = []
+        # The hand currently being played
+        self._current_hand:  Optional[PendingHand] = None
+
+    # ------------------------------------------------------------------
+    # Hand lifecycle
+    # ------------------------------------------------------------------
 
     def begin_hand(self) -> None:
-        self._hand_history.clear()
+        """Called once at the start of each hand."""
+        self._current_hand = PendingHand()
 
     def act(self, obs: PlayerObservation) -> Action:
+        """Select an action and record the transition in the current hand."""
         feat   = self.encoder.encode(obs)
         mask   = legal_action_mask(obs)
         feat_t = torch.tensor(feat, dtype=torch.float32, device=self.device).unsqueeze(0)
@@ -192,26 +276,84 @@ class AdaptiveAgent:
             val           = float(value.squeeze().item())
 
         self.feat_store.add(feat)
-        self._hand_history.append((feat, mask.numpy(), idx, float(lp.item()), val))
+        self._current_hand.add_transition(feat, mask.numpy(), idx, float(lp.item()), val)
         return index_to_action(idx, self.seat)
 
     def on_hand_end(self, terminal_reward: float) -> bool:
+        """
+        Finalise the current hand, append it to the pending batch, and
+        — once the batch is full — commit all hands to the rollout buffer
+        with normalised rewards.
+
+        Returns True if the convergence detector has fired.
+        """
+        self._current_hand.terminal_reward = terminal_reward
+        self._pending_hands.append(self._current_hand)
+        self._current_hand = None
+
+        converged = False
+
+        if len(self._pending_hands) >= HANDS_PER_MINI_BATCH:
+            converged = self._commit_batch()
+
+        return converged
+
+    # ------------------------------------------------------------------
+    # Batch commit
+    # ------------------------------------------------------------------
+
+    def _commit_batch(self) -> bool:
+        """
+        Normalise rewards across the accumulated batch of hands, write all
+        transitions into the RolloutBuffer, and update the convergence
+        detector.
+
+        Returns True if the convergence detector has fired.
+        """
+        hands = self._pending_hands
+        self._pending_hands = []
+
+        # ── Step 1: collect raw terminal rewards ──────────────────────
+        raw_rewards = np.array(
+            [h.terminal_reward for h in hands], dtype=np.float32
+        )
+
+        # ── Step 2: optionally normalise across the batch ─────────────
+        if NORMALISE_BATCH_REWARDS:
+            r_mean = raw_rewards.mean()
+            r_std  = raw_rewards.std()
+            normed_rewards = (raw_rewards - r_mean) / (r_std + REWARD_NORM_EPS)
+        else:
+            normed_rewards = raw_rewards
+
+        # ── Step 3: write transitions into the rollout buffer ─────────
         buf = self.trainer.buffer
-        for k, (feat, mask_np, idx, lp, val) in enumerate(self._hand_history):
-            is_last = (k == len(self._hand_history) - 1)
-            buf.add(
-                feature=feat,
-                mask=mask_np,
-                action=idx,
-                log_prob=lp,
-                value=val,
-                reward=terminal_reward if is_last else 0.0,
-                done=is_last,
-            )
-        sample = self.feat_store.sample_tensor(256, self.device)
-        return self.detector.on_hand_end(self.network, sample, self.device)
+        for hand, reward in zip(hands, normed_rewards):
+            n = len(hand.transitions)
+            for k, (feat, mask_np, idx, lp, val) in enumerate(hand.transitions):
+                is_last = (k == n - 1)
+                buf.add(
+                    feature  = feat,
+                    mask     = mask_np,
+                    action   = idx,
+                    log_prob = lp,
+                    value    = val,
+                    reward   = float(reward) if is_last else 0.0,
+                    done     = is_last,
+                )
+
+        # ── Step 4: update convergence detector once per batch ────────
+        sample    = self.feat_store.sample_tensor(256, self.device)
+        converged = self.detector.on_hand_end(self.network, sample, self.device)
+
+        return converged
+
+    # ------------------------------------------------------------------
+    # PPO update
+    # ------------------------------------------------------------------
 
     def maybe_update(self) -> Optional[Dict]:
+        """Trigger a PPO update if the buffer has accumulated enough steps."""
         if len(self.trainer.buffer) >= ABLATION_PPO_CFG.n_steps_per_update:
             self.network.train()
             stats = self.trainer.update()
@@ -223,6 +365,10 @@ class AdaptiveAgent:
         self.trainer.cfg.kl_coef = max(
             KL_FLOOR, self.trainer.cfg.kl_coef * KL_ANNEAL_FACTOR
         )
+
+    def pending_batch_size(self) -> int:
+        """Number of hands currently waiting in the accumulator."""
+        return len(self._pending_hands)
 
 
 # ---------------------------------------------------------------------------
@@ -260,7 +406,6 @@ def run_ablation_training() -> None:
         seat: FixedAgent(seat, load_network(), device)
         for seat in [1, 2, 3]
     }
-    # Make fixed agents' networks also frozen (for safety)
     for fa in fixed_agents.values():
         for p in fa.network.parameters():
             p.requires_grad_(False)
@@ -274,18 +419,33 @@ def run_ablation_training() -> None:
     agent0 = AdaptiveAgent(0, load_network(), base_network, rf, cfg, device)
     agent0.network.eval()
 
-    log.info("Adaptive agent (seat 0): α=%.4f, β=%.4f",
-             ABLATION_REWARD_PARAMS.alpha, ABLATION_REWARD_PARAMS.beta)
+    log.info(
+        "Adaptive agent (seat 0): α=%.4f, β=%.4f  |  "
+        "mini-batch=%d hands, reward normalisation=%s",
+        ABLATION_REWARD_PARAMS.alpha,
+        ABLATION_REWARD_PARAMS.beta,
+        HANDS_PER_MINI_BATCH,
+        NORMALISE_BATCH_REWARDS,
+    )
 
     # ── Training loop ──────────────────────────────────────────────────────
-    training_log = []
-    hand_count   = 0
-    update_count = 0
-    start_time   = time.time()
+    training_log  = []
+    hand_count    = 0
+    update_count  = 0
+    batch_count   = 0
+    start_time    = time.time()
 
-    log.info("Starting ablation training.  MAX_HANDS=%d", MAX_HANDS)
+    # Running statistics for logging reward signal health
+    reward_history: List[float] = []
 
-    while hand_count < MAX_HANDS:
+    log.info(
+        "Starting ablation training.  MAX_HANDS=%d  HANDS_PER_MINI_BATCH=%d",
+        MAX_HANDS, HANDS_PER_MINI_BATCH,
+    )
+
+    converged = False
+
+    while hand_count < MAX_HANDS and not converged:
         agent0.begin_hand()
 
         def cb0(obs: PlayerObservation) -> Action:
@@ -304,51 +464,86 @@ def run_ablation_training() -> None:
 
         reward_components = agent0.reward_fn.compute(traj, 0)
         terminal_reward   = reward_components.total
-        converged         = agent0.on_hand_end(terminal_reward)
+        reward_history.append(terminal_reward)
+
+        # on_hand_end accumulates into the batch; commits when batch is full
+        converged = agent0.on_hand_end(terminal_reward)
+        if converged:
+            # Batch was just committed inside on_hand_end; count it
+            batch_count += 1
+
         agent0.anneal_kl()
 
+        # Track when a batch commit occurred (pending list was just cleared)
+        batch_just_committed = (
+            agent0.pending_batch_size() == 0
+            and hand_count % HANDS_PER_MINI_BATCH == 0
+        )
+        if batch_just_committed:
+            batch_count += 1
+
+        # Trigger PPO update if the rollout buffer is now sufficiently full
         stats = agent0.maybe_update()
         if stats is not None:
             update_count += 1
-            training_log.append({
-                "hand":        hand_count,
-                "update":      update_count,
-                "policy_loss": stats["policy_loss"],
-                "value_loss":  stats["value_loss"],
-                "entropy":     stats["entropy"],
-                "kl_penalty":  stats["kl_penalty"],
-                "mean_kl":     agent0.detector.latest_mean_kl(),
-            })
+
+            # Reward signal stats over the hands that fed this update
+            recent_rewards = reward_history[-HANDS_PER_MINI_BATCH * 4:]
+            r_arr   = np.array(recent_rewards)
+            r_mean  = float(r_arr.mean())
+            r_std   = float(r_arr.std())
+
+            entry = {
+                "hand":         hand_count,
+                "update":       update_count,
+                "batch":        batch_count,
+                "policy_loss":  stats["policy_loss"],
+                "value_loss":   stats["value_loss"],
+                "entropy":      stats["entropy"],
+                "kl_penalty":   stats["kl_penalty"],
+                "mean_kl":      agent0.detector.latest_mean_kl(),
+                "reward_mean":  r_mean,
+                "reward_std":   r_std,
+            }
+            training_log.append(entry)
+
             if update_count % 10 == 0:
                 log.info(
-                    "  Update %3d | π-loss %.4f | entropy %.4f | KL-pen %.4f",
-                    update_count, stats["policy_loss"], stats["entropy"], stats["kl_penalty"],
+                    "  Update %3d | π-loss %.4f | entropy %.4f | "
+                    "KL-pen %.4f | r̄=%.3f σ=%.3f",
+                    update_count,
+                    stats["policy_loss"],
+                    stats["entropy"],
+                    stats["kl_penalty"],
+                    r_mean,
+                    r_std,
                 )
 
         if hand_count % LOG_EVERY == 0:
             elapsed  = time.time() - start_time
             hands_ph = hand_count / max(elapsed, 1) * 3600
             log.info(
-                "Hand %7d | ConvergeKL %.5f | %.0f hands/hr",
-                hand_count, agent0.detector.latest_mean_kl(), hands_ph,
+                "Hand %7d | batch %4d | ConvergeKL %.5f | %.0f hands/hr",
+                hand_count,
+                batch_count,
+                agent0.detector.latest_mean_kl(),
+                hands_ph,
             )
 
         if hand_count % SAVE_EVERY == 0:
             _save_agent(agent0.network, hand_count)
 
-        if converged:
-            log.info("Ablation agent converged at hand %d (KL=%.5f).",
-                     hand_count, agent0.detector.latest_mean_kl())
-            break
-
     # ── Final saves ────────────────────────────────────────────────────────
+    if converged:
+        log.info("Ablation agent converged at hand %d (KL=%.5f).",
+                 hand_count, agent0.detector.latest_mean_kl())
     log.info("Ablation training complete.  Total hands: %d", hand_count)
+
     _save_agent(agent0.network, hand_count, final=True)
 
     params_record = [
         {"seat": 0, "alpha": ABLATION_REWARD_PARAMS.alpha, "beta": ABLATION_REWARD_PARAMS.beta}
     ]
-    # Add neutral params for seats 1–3 (they never adapted)
     for s in [1, 2, 3]:
         params_record.append({"seat": s, "alpha": 0.0, "beta": 0.0})
 
@@ -364,17 +559,19 @@ def run_ablation_training() -> None:
 
 
 def _save_agent(network: ActorCriticNetwork, step: int, final: bool = False) -> None:
-    name = "ablation_perturbed_agent_0.pt" if final else f"ablation_ckpt_step{step}.pt"
+    name = "ablation_perturbed_agent_0.pt" if final else "ablation_ckpt.pt"
     path = os.path.join(CHECKPOINT_DIR, name)
     torch.save({
-        "network_state": network.state_dict(),
-        "hidden_dim":    network.hidden_dim,
-        "feature_dim":   FEATURE_DIM,
-        "num_actions":   NUM_ACTIONS,
-        "seat":          0,
-        "step":          step,
-        "alpha":         ABLATION_REWARD_PARAMS.alpha,
-        "beta":          ABLATION_REWARD_PARAMS.beta,
+        "network_state":       network.state_dict(),
+        "hidden_dim":          network.hidden_dim,
+        "feature_dim":         FEATURE_DIM,
+        "num_actions":         NUM_ACTIONS,
+        "seat":                0,
+        "step":                step,
+        "alpha":               ABLATION_REWARD_PARAMS.alpha,
+        "beta":                ABLATION_REWARD_PARAMS.beta,
+        "hands_per_mini_batch": HANDS_PER_MINI_BATCH,
+        "normalise_rewards":   NORMALISE_BATCH_REWARDS,
     }, path)
 
 

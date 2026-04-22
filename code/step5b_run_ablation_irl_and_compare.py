@@ -64,6 +64,8 @@ from step3_collect_and_run_irl import (
     LOG_COLLECT_EVERY,
     OPP_MIN_SAMPLES,
     VAR_WINDOW,
+    IRL_GRAD_ACCUM_STEPS,
+    IRL_BATCH_SIZE,
 )
 from step4_evaluate_results import run_evaluation
 
@@ -264,6 +266,8 @@ def run_ablation_comparison() -> None:
     # ── Step 6: Run IRL on seat 0 ─────────────────────────────────────────
     log.info("\n" + "=" * 62)
     log.info("ABLATION IRL — Target seat 0")
+    log.info("  (grad_accum=%d, eff. batch=%d hands — inherited from step3)",
+             IRL_GRAD_ACCUM_STEPS, IRL_BATCH_SIZE * IRL_GRAD_ACCUM_STEPS)
     log.info("=" * 62)
 
     abl_result = run_irl_for_seat(
