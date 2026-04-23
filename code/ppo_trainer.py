@@ -472,9 +472,11 @@ class ConvergenceDetector:
         network:  ActorCriticNetwork,
         features: Optional[torch.Tensor],
         device:   torch.device,
+        num_hands: int = 1,
     ) -> bool:
-        """Call after each hand.  Returns True when convergence is detected."""
-        self._hand_count += 1
+        """Call after each hand (or batch). Returns True when convergence is detected."""
+        old_count = self._hand_count
+        self._hand_count += num_hands
 
         # Ensure we always create the first snapshot once warmup is complete
         # and features are available, even if exact boundary timing is missed.
@@ -484,7 +486,10 @@ class ConvergenceDetector:
         if self._hand_count < self.min_hands:
             return False
 
-        if self._hand_count % self.check_every == 0 and features is not None:
+        # Detect if we crossed a check boundary (e.g., passed the 1000 mark)
+        crossed_boundary = (self._hand_count // self.check_every) > (old_count // self.check_every)
+
+        if crossed_boundary and features is not None:
             if self._snapshot is not None:
                 kl = _kl_between_snapshots(network, self._snapshot, features, device)
                 self._kl_buf.append(kl)

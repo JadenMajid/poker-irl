@@ -330,8 +330,11 @@ def _worker_update(seat: int, pending_hands: List["PendingHand"]) -> UpdateResul
                     done     = is_last,
                 )
 
+        # Update convergence detector once per batch commit
         sample    = agent.feat_store.sample_tensor(256, agent.device)
-        converged = agent.detector.on_hand_end(agent.network, sample, agent.device)
+        converged = agent.detector.on_hand_end(
+            agent.network, sample, agent.device, num_hands=len(pending_hands)
+        )
 
     # ── PPO update ─────────────────────────────────────────────────────────
     stats = agent.maybe_update()
@@ -497,7 +500,9 @@ class IndependentAgent:
 
         # Update convergence detector once per batch commit
         sample = self.feat_store.sample_tensor(256, self.device)
-        return self.detector.on_hand_end(self.network, sample, self.device)
+        return self.detector.on_hand_end(
+            self.network, sample, self.device, num_hands=len(hands)
+        )
 
     def maybe_update(self) -> Optional[Dict]:
         """Run PPO update if buffer is full enough.  Returns stats dict or None."""

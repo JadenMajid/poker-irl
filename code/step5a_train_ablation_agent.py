@@ -344,7 +344,9 @@ class AdaptiveAgent:
 
         # ── Step 4: update convergence detector once per batch ────────
         sample    = self.feat_store.sample_tensor(256, self.device)
-        converged = self.detector.on_hand_end(self.network, sample, self.device)
+        converged = self.detector.on_hand_end(
+            self.network, sample, self.device, num_hands=len(hands)
+        )
 
         return converged
 
