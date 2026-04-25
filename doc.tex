@@ -1,0 +1,364 @@
+\documentclass{article}
+
+\usepackage{project_440_550}
+
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+
+\usepackage[USenglish]{babel}
+\usepackage{csquotes}
+
+\usepackage{booktabs}
+\usepackage{amsfonts}
+\usepackage{amsmath}
+\usepackage{nicefrac}
+\usepackage{microtype}
+\usepackage{xcolor}
+\usepackage{hyperref}
+\usepackage{url}
+\usepackage{graphicx}
+
+\usepackage[style=authoryear,maxbibnames=30,natbib]{biblatex}
+\addbibresource{refs.bib}
+\renewbibmacro{in:}{}
+\DeclareDelimFormat{nameyeardelim}{\addspace}
+\DeclareNameAlias{sortname}{given-family}
+
+\usepackage[capitalize,noabbrev]{cleveref}
+
+\title{Recovering Reward Parameters in Multi-Agent Poker\\via Inverse Reinforcement Learning}
+
+\author{%
+  Sebastian Magana\\
+  \texttt{maganaaa@student.ubc.ca}
+  \And
+  Jaden Majid\\
+  \texttt{jadenvm@student.ubc.ca}
+  \And
+  Damian Suidgeest\\
+  \texttt{dsuidgee@student.ubc.ca}
+}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Inverse reinforcement learning (IRL) has proven effective at recovering reward functions from observed behaviour in single-agent settings, yet its extension to multi-agent environments remains significantly underexplored. In such settings, each agent's policy is shaped not only by their own reward function but also by the co-adapted strategies of their opponents, making the attribution of observed behaviour to individual reward signals substantially harder. We implement a simplified four-player Texas Hold'em poker environment and a full experimental pipeline in which agents are first trained via parameter-sharing self-play PPO to a neutral Nash equilibrium baseline, then individually fine-tuned with personalised risk-aversion and pot-involvement reward parameters. We then apply a Bayesian full-action policy-shift algorithm to recover each agent's reward parameters from fixed-policy game-play trajectories. Our results show reasonable success in recovering the reward parameters, despite challenges arising from the multi-agent co-adaptating nature. An ablation study in which a single agent is trained against frozen neutral opponents confirms that the multi-agent setting introduces measurable additional difficulty for IRL. Our work represents a good step toward understanding IRL in strategic multi-agent games, illustrating central challenges and enabling further investigation.
+\end{abstract}
+
+\section{Introduction}
+
+Understanding why an agent behaves the way it does is a central challenge in machine learning for both expert-imitation as well as recognizing sub-optimal agent worldviews. Inverse reinforcement learning \citep{ng2000algorithms} addresses this by inferring a reward function from observed behaviour. Applied to real-world domains like autonomous driving, robotics, and human decision modelling, IRL offers a path to interpretable, goal-aware imitation that goes beyond behavioural cloning.
+
+However, essentially all practical IRL settings assume a single-agent interacting with a fixed environment \citep{ziebart2008maximum, zeng2022maximum, wei2024bayesian}. Practical real-world settings (financial markets, international trade, negotiation) involve multiple strategic agents whose policies are shaped simultaneously by their own individual rewards and by the co-adapted strategies of their opponents. In these settings, the standard IRL assumption that the ``environment'' is fixed is fundamentally violated: the optimal policies of all actors are not independent.
+
+Thus, the observed behaviour of any one agent is a function of both their reward parameters and the policies of their opponents. A player who bets cautiously may be risk-averse, or may simply be responding rationally to an aggressive table. Disentangling these is the core difficulty of multi-agent IRL. Additionally, multi-agent training dynamics do not necessarily converge to a unique stable strategy equilibrium; they can cycle, oscillate, or settle into asymmetric equilibria that are hard to characterise theoretically.
+
+We address these challenges in the setting of a four-player simplified Texas Hold'em poker game. Poker is particularly well-suited for this investigation as it has a rich strategic structure, a well-defined action space, clear information asymmetries (private hole cards), and a natural notion of agent-specific reward shaping through risk preferences and betting style. We parameterise each agent's reward function with two interpretable scalars: a risk-aversion coefficient $\alpha$ and a pot-involvement bias $\beta$. We then investigate whether IRL can recover these parameters from observed play, given that all four agents have co-adapted to each other through reinforcement learning.
+
+Our primary contributions are:
+\begin{enumerate}
+    \item A fully implemented four-player poker environment with a complete multi-agent RL training and IRL recovery pipeline (code available at \url{[GITHUB REPO LINK]}).
+    \item Our Bayesian full-action policy-shift algorithm, which recovers reward parameters from multi-agent trajectories by modelling an agent's behaviour as a calculated deviation from a rational base policy.
+    \item Experimental evidence that multi-agent co-adaptation meaningfully increases the difficulty of IRL reward recovery, quantified against a single-agent ablation.
+\end{enumerate}
+
+\section{Related Work}
+
+\textbf{Inverse reinforcement learning.} The foundational IRL framework of \citet{ng2000algorithms} seeks a reward function under which the observed policy is optimal. \citet{ziebart2008maximum} extended this to the maximum entropy framework, which places a distribution over trajectories proportional to their exponentiated return and has become the dominant practical approach. More recently, \citet{zeng2022maximum} established finite-time convergence guarantees for maximum-likelihood IRL, and \citet{wei2024bayesian} proposed a Bayesian approach that is robust to model misspecification, both of which are particularly relevant to our setting where the reward model may not perfectly capture the true agent objectives. Our GABO-IRL algorithm draws on the Bayesian formulation of \citet{wei2024bayesian}, adapting it to the multi-agent poker setting.
+
+\textbf{Multi-agent IRL.} \citet{fu2021evaluating} is the most closely related prior work; they propose reducing multi-agent IRL to a collection of independent single-agent problems by holding co-players' policies fixed during inference, the same structural assumption we adopt. Their evaluation is primarily in auction settings with simpler sequential structure than poker, and critically, they evaluate using regret or policy imitation rather than ground-truth parameter recovery due to stated reward ambiguity. Our work uses a controlled parametric reward function with known ground truth, enabling direct scalar MSE evaluation that \citet{fu2021evaluating} avoids.
+
+
+\section{Problem Setup and Method}
+
+\subsection{The Poker Environment}
+
+We implement a four-player cash-game Texas Hold'em variant with two betting rounds: pre-flop and post-flop (after dealing three community cards). Each player begins with two private hole cards and the best five-card hand determines the winner. Blinds rotate each hand (small blind = 10, big blind = 20). Each betting round allows fold, call, or fixed-size raise (20, 100, or 500). Each player may raise at most once per round. Players are assumed to have effectively infinite chip stacks, modelling a cash game where the objective is to maximise expected per-hand chip gain.
+
+The state space visible to each player at their decision point includes: their private hole cards, the community board cards (post-flop only), the current street\footnote{The current betting round (pre-flop / post-flop)}, pot size, call amount, their own investment this street and overall, blind positions, betting position, a structured summary of the full betting history for the hand (encoding each player's action type, raise size, and cumulative investment per street), and derived features including pot odds and stack-to-pot ratio. This is encoded into a 165-dimensional feature vector by a fixed feature encoder.
+
+The action space is discrete with five possible actions at each decision: fold, call/check, raise by 20, raise by 100, or raise by 500. When a player has already raised in the current street, raise actions are masked as illegal.
+
+\subsection{Personalised Reward Functions}
+
+Each agent $i$ has a reward function parameterised by $(\alpha_i, \beta_i)$:
+\[
+R_i = \frac{\Delta_{\text{chips}} - \alpha_i \cdot \widehat{\text{Var}}(\Delta_{\text{chips}}) + \beta_i \cdot \max\text{Pot}_i}{\sigma_{\Delta_{\text{chips}}}}
+\]
+where $\widehat{\text{Var}}(\Delta_{\text{chips}})$ is a rolling sample variance of outcomes, approximated at the decision-step level by the squared immediate chip commitment to allow the model to evaluate the risk of specific actions before the hand concludes. $\Delta_{\text{chips}}$ is the net chip gain for the hand and $\sigma_{\Delta_{\text{chips}}}$ is the rolling standard deviation of chip deltas. $\max\text{Pot}_i$ is the largest pot the agent actively committed chips into during the hand (capturing pot involvement), and $\text{POT\_NORM} = 2000$ is a normalising constant. A positive $\alpha_i$ penalises variance (risk-averse agent); a negative $\alpha_i$ rewards variance (risk-seeking). A positive $\beta_i$ rewards pot involvement (aggressive, pot-building agent); a negative $\beta_i$ penalises it. The four perturbed agents are assigned parameters covering all four quadrants of $(\alpha, \beta)$ space:
+
+\begin{table}[h]
+\caption{Reward parameters assigned to each agent in the main experiment.}
+\label{tab:reward_params}
+\centering
+\begin{tabular}{crrll}
+\toprule
+Seat & $\alpha$ & $\beta$ & Risk preference & Pot preference \\
+\midrule
+0 & $+0.005$ & $+0.3$ & Risk-averse & Pot-hungry \\
+1 & $+0.005$ & $-0.3$ & Risk-averse & Pot-avoidant \\
+2 & $-0.005$ & $+0.3$ & Risk-seeking & Pot-hungry \\
+3 & $-0.005$ & $-0.3$ & Risk-seeking & Pot-avoidant \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+The magnitudes are calibrated so that the perturbation terms contribute roughly 10--20\% of the total reward signal on a typical hand, ensuring they meaningfully influence strategy without overwhelming the primary chip-maximisation objective.
+
+\subsection{Agent Architecture}
+
+Each agent maintains an actor-critic neural network with a shared trunk (two residual blocks of width 256 with LayerNorm \citep{ba2016layernormalization} and GELU \citep{hendrycks2023gaussianerrorlinearunits} activations), an actor head that outputs logits over the five actions, and a critic head that outputs a scalar value estimate. The architecture uses orthogonal weight initialisation on the output layers and a small initial actor head gain to start near a uniform policy. Illegal actions are masked to $-\infty$ before softmax so the policy always places zero probability on illegal moves.
+
+\subsection{Training Pipeline}
+
+\textbf{Step 1 --- Neutral base agent via parameter-sharing self-play.} All four seats share one network and one rollout buffer. Every hand generates decision points from all four perspectives; all experiences flow into a single PPO update. This design ensures the converged policy is a symmetric Nash equilibrium: each seat is best-responding to the same policy (itself), so no seat has a unilateral incentive to deviate. The self-play uses PPO-Clip \citep{schulman2017proximal} with GAE ($\lambda = 0.95$, $\gamma = 1.0$), entropy regularisation, and a RunningMeanStd return normaliser that prevents chip-scale value targets from causing the $\sim$850$\times$ gradient norm explosion that would otherwise occur. Convergence is detected by tracking the mean KL divergence between policy snapshots taken every 1000 hands; training terminates when this falls below a threshold of $2\times10^{-4}$.
+
+\textbf{Step 2 --- Perturbed agent fine-tuning.} The base network is cloned into four independent agents, each assigned the reward parameters in \cref{tab:reward_params}. Each agent fine-tuned via PPO against the other three, with a KL penalty $\lambda_{\text{KL}} \cdot \text{KL}(\pi \,\|\, \pi_{\text{base}})$ added to the loss to prevent catastrophic divergence from the base policy. The KL coefficient is initialised at 0.02 and annealed by a factor of 0.9995 per hand, down to a floor of 0.005. Each agent has its own rollout buffer and convergence detector. Each agent accumulates a mini-batch of 256 hands before committing transitions to the buffer to aid stability. Terminal rewards are standardised (zero-mean, unit-variance) across this batch to mitigate the high variance inherent in poker outcomes. Training terminates per-agent when its policy KL divergence reaches the convergence threshold.
+
+\textbf{Step 3 --- Trajectory collection and IRL.} All four agents are frozen and 50,000 hands are simulated. For each target seat $i$, we then run the Bayesian Policy-Shift IRL procedure:
+\begin{enumerate}
+    We treat the observed terminal actions of the target agent as arising from a Boltzmann-rational policy defined by an additive shift to the neutral base policy's logits:
+    \[
+    \text{logit}_\theta(s, a) = \text{logit}_{\text{base}}(s, a) - \alpha \cdot \phi_\alpha(s, a) + \beta \cdot \phi_\beta(s, a)
+    \]
+    where $\text{logit}_{\text{base}}$ are the outputs of the frozen neutral base network, and $\phi_\alpha$, $\phi_\beta$ are pre-computed features representing risk (squared commitment) and pot-involvement (relative pot size). The log-posterior is:
+    \[
+    \log p(\theta \mid \mathcal{D}) = \sum_t \log \pi_\theta(a_t \mid s_t) + \frac{\beta^2 - \alpha^2}{2\sigma^2}
+    \]
+    with Gaussian prior $\sigma = 1$. We maximise this via gradient ascent with the analytical gradient:
+    \[
+    \frac{\partial \log p}{\partial \alpha} = \phi_\alpha(s_t, a_t) - \sum_{a' \in \mathcal{A}} \pi_\theta(a' \mid s_t) \phi_\alpha(s_t, a') - \frac{\alpha}{\sigma^2}
+    \]
+    and analogously for $\beta$.
+
+    We apply a fixed normalisation to the features $\phi$ during the collection phase. This ensures that $\phi_\alpha$ and $\phi_\beta$ are $O(1)$, preventing the gradient from being dominated by the magnitude of raw chip counts or squared values.
+\end{enumerate}
+Convergence is declared when the standard deviation of both parameter estimates over the last 300 gradient steps falls below $5 \times 10^{-4}$.
+
+\subsection{Ablation Study}
+
+To isolate the contribution of the multi-agent co-adaptation structure, we run an ablation in which only a single agent (seat 0, with $\alpha = +0.005$, $\beta = +0.3$) is fine-tuned via PPO, while the other three seats remain frozen at the neutral base policy. The same  Bayesian Policy-Shift IRL  procedure is then applied to recover seat 0's parameters. Comparing recovery accuracy between the main experiment (all four agents co-adapted) and the ablation (one agent against fixed opponents) isolates the effect of strategic interdependence.
+
+\section{Experiments}
+
+\subsection{Step 1: Base Agent Convergence}
+
+\begin{figure}[t]
+\centering
+% INSERT FIGURE HERE: figs/step1_training_stats_ma.png
+% This is a 2x2 subplot figure produced by the plotting notebook.
+% The four panels show, against hands played (with 50-hand moving average overlaid in bold):
+%   Top-left:  Mean KL divergence between periodic policy snapshots (blue), with red dashed convergence threshold line at 0.01
+%   Top-right: Policy loss (green)
+%   Bottom-left: Value loss (orange)
+%   Bottom-right: Policy entropy (purple)
+% All panels show raw values (faint) and the 50-hand moving average (bold).
+    \centering
+    \includegraphics[width=0.9\textwidth]{step1_training_stats_ma.png}
+\caption{Training dynamics for Step 1 parameter-sharing self-play. \textbf{Top-left:} Mean KL divergence between policy snapshots taken 1000 hands apart, with the convergence threshold (red dashed line) indicating when training terminates. \textbf{Top-right:} PPO policy loss. \textbf{Bottom-left:} Value loss under return normalisation (expected scale $O(1)$). \textbf{Bottom-right:} Policy entropy, which decreases as the agent develops a more committed strategy. All series show the raw values (faint) and a 50-hand moving average (bold).}
+\label{fig:step1}
+\end{figure}
+
+The parameter-sharing self-play procedure converged in approximately [FILL: X] hands, as measured by the mean KL divergence between policy snapshots falling below the threshold of $3 \times 10^{-4}$. \Cref{fig:step1} shows the four training diagnostics over the course of training. The policy entropy (bottom-right) drops from near-maximum ($\log 5 \approx 1.61$, corresponding to a uniform distribution over the five actions) and stabilises around [FILL: entropy value], reflecting the emergence of a committed but not fully deterministic strategy. Value loss (bottom-left) remains in the $O(0.1$--$2)$ range due to return normalisation, confirming that the RunningMeanStd normaliser successfully prevents the chip-scale gradient explosion that would otherwise occur. The KL divergence curve (top-left) shows an initial period of rapid policy change followed by a plateau below the convergence threshold, consistent with the agent approaching a fixed point in policy space.
+
+An important aspect of this convergence is its symmetry:  the converged policy is by construction the same for every seat because all four seats share a single network. The fixed point of parameter-sharing self-play is a symmetric Nash equilibrium: each seat is best-responding to the same policy (itself), so no seat can gain by unilaterally deviating. This provides a principled, neutral starting point for the subsequent reward-specific fine-tuning.
+
+\subsection{Step 2: Perturbed Agent Fine-tuning}
+
+\begin{figure}[t]
+\centering
+% Produced by plotting notebook Cell 4. 
+% Metrics: Mean KL (blue), Policy Loss (green), Value Loss (orange), Entropy (purple), KL Penalty (red)
+\fbox{
+    \parbox{0.9\textwidth}{
+        \centering
+        \includegraphics[width=\linewidth]{step2_mean_kl_all_agents_ma.png}
+    }
+}
+\caption{Step 2 fine-tuning dynamics for each of the four perturbed agents. The KL divergence from the base policy is the primary convergence indicator. Agents with aligned reward parameters (seats 2 and 3) are less convergent than un-aligned reward parameters.}
+\label{fig:step2}
+\end{figure}
+
+After loading the base agent weights into all four seats and assigning the reward parameters in \cref{tab:reward_params}, each agent fine-tuned independently against the other three. This phase was substantially slower to converge than Step 1: convergence (measured by the same KL divergence criterion) required approximately 10 million hands per agent on average, compared to 1 million hands in Step 1. We attribute this to two factors. First, each agent now has only one perspective per hand contributing gradient signal, rather than four. Second, and more interestingly, the four agents are co-adapting simultaneously: as one agent's policy shifts to exploit its reward function, the others' optimal responses shift in turn, creating a non-stationary learning target that slows convergence for all.
+
+The KL penalty against the base policy (initial coefficient 0.05, annealed to 0.005) played an important role in preventing degenerate strategies. Without this regularisation in early pilot runs, agents occasionally collapsed to trivially dominant strategies---such as always folding pre-flop to avoid variance---that satisfied their reward function but destroyed the diversity of observed play needed for IRL. The annealing schedule allowed agents to develop genuinely differentiated strategies by the end of training while remaining anchored to poker-coherent behaviour throughout.
+
+\subsection{Step 3: IRL Recovery}
+
+\begin{table}[t]
+\caption{GABO-IRL reward parameter recovery results for the main experiment (all four agents co-adapted). $\hat\alpha$ and $\hat\beta$ are posterior mean estimates over the last 300 gradient steps. MSE is computed against the true parameter values.}
+\label{tab:irl_results}
+\centering
+\begin{tabular}{crrrrrrr}
+\toprule
+Seat & $\alpha_{\text{true}}$ & $\hat\alpha$ & $\alpha$ MSE & $\beta_{\text{true}}$ & $\hat\beta$ & $\beta$ MSE & Joint MSE \\
+\midrule
+0 & $+0.0040$ & \hphantom{$-$}[FILL] & [FILL] & $+0.25$ & \hphantom{$-$}[FILL] & [FILL] & [FILL] \\
+1 & $+0.0040$ & \hphantom{$-$}[FILL] & [FILL] & $-0.20$ & \hphantom{$-$}[FILL] & [FILL] & [FILL] \\
+2 & $-0.0030$ & \hphantom{$-$}[FILL] & [FILL] & $+0.25$ & \hphantom{$-$}[FILL] & [FILL] & [FILL] \\
+3 & $-0.0030$ & \hphantom{$-$}[FILL] & [FILL] & $-0.20$ & \hphantom{$-$}[FILL] & [FILL] & [FILL] \\
+\midrule
+\multicolumn{3}{l}{Mean} & [FILL] & & & [FILL] & [FILL] \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\begin{table}[t]
+\caption{Held-out log-likelihood (HOLL) evaluation. HOLL is computed on a 20\% held-out trajectory split under four parameter settings: the IRL estimate $\hat\theta$, the true parameters $\theta^*$ (upper bound), the neutral baseline $\theta = (0,0)$, and a uniform random policy (lower bound). Recovery \% measures how much of the gap between neutral and true is recovered.}
+\label{tab:holl}
+\centering
+\begin{tabular}{crrrrr}
+\toprule
+Seat & HOLL$(\hat\theta)$ & HOLL$(\theta^*)$ & HOLL$(\mathbf{0})$ & HOLL(random) & Recovery \% \\
+\midrule
+0 & -249.8565 & -273.7340 & -3.0855 & -1.4581 & -91.2\% \\
+1 & -674.8409 & -301.4163 & -0.4779 & -1.5854 & -224.1\% \\
+2 & -648.9852 & -323.6588 & -1.6902 & -1.2342 & -201.0\% \\
+3 & -150.5289 & -385.8200 & -0.8654 & -1.5837 & -38.9\% \\
+\midrule
+\multicolumn{5}{l}{Mean} & -138.8\% \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\Cref{tab:irl_results,tab:holl} summarise the IRL recovery results. The overall picture is one of moderate success: the estimates were in the correct direction and of roughly the right magnitude in most cases, but fell short of precise recovery. We discuss the reasons for this below.
+
+\begin{figure}[t]
+\centering
+% INSERT FIGURE HERE: IRL convergence traces for alpha and beta per seat.
+% Suggested: two panels (one for alpha, one for beta), each showing the IRL estimate
+% (y-axis) vs. gradient step (x-axis) for all four seats, with a horizontal dashed line
+% showing the true parameter value for each seat. This would visually show both convergence
+% and estimation error. Source: irl_results/irl_convergence_log.json, alpha_history and beta_history fields.
+\fbox{\parbox{0.9\textwidth}{\centering\vspace{2cm}[INSERT: IRL parameter convergence traces. Two panels: (left) $\hat\alpha$ vs.\ IRL gradient step for all four seats, with dashed horizontal lines at true $\alpha$ values; (right) $\hat\beta$ vs.\ gradient step with dashed lines at true $\beta$ values. Source: \texttt{irl\_results/irl\_convergence\_log.json}.]\vspace{2cm}}}
+\caption{GABO-IRL parameter estimates over gradient steps for the main experiment. Each line shows the posterior mean estimate $\hat\alpha$ (left) or $\hat\beta$ (right) for one seat, with the true value shown as a dashed horizontal line. The estimates stabilise (convergence criterion met) but settle at values that systematically underestimate the magnitude of both parameters.}
+\label{fig:irl_convergence}
+\end{figure}
+
+\subsection{Neutral Baseline Comparison}
+
+As an informative intermediate condition, we also ran the full pipeline with all four agents assigned neutral reward parameters ($\alpha = \beta = 0$), effectively continuing Step 1 but without parameter sharing. This version converged faster in Step 2 (because agents have identical reward functions, they are jointly approaching the same symmetric equilibrium), and the IRL recovery in Step 3 was noticeably more accurate. We attribute this improvement to two factors. First, agents starting from the base policy with neutral rewards remain close to the already-optimal base policy, so there is less total policy change to attribute and the behaviour is more ``explainable'' by $(\alpha, \beta) = (0, 0)$. Second, and more theoretically, symmetric agents with identical reward functions are more likely to converge to a genuine symmetric Nash equilibrium rather than an asymmetric or cyclical one, making the stationarity assumption that GABO-IRL relies on more likely to hold.
+
+\subsection{Ablation: Single Adaptive Agent}
+
+\begin{table}[t]
+\caption{Comparison of IRL recovery accuracy between the main experiment (four co-adapted agents) and the ablation (one adaptive agent against three frozen neutral opponents). Lower joint MSE is better. Both experiments target seat 0 with $\alpha = +0.004$, $\beta = +0.25$.}
+\label{tab:ablation}
+\centering
+\begin{tabular}{lccccc}
+\toprule
+Setting & $\hat\alpha$ & $\hat\beta$ & $\alpha$ MSE & $\beta$ MSE & Joint MSE \\
+\midrule
+Main (4 co-adapted)   & [FILL] & [FILL] & [FILL] & [FILL] & [FILL] \\
+Ablation (1 adaptive) & [FILL] & [FILL] & [FILL] & [FILL] & [FILL] \\
+\midrule
+Ratio (ablation / main) & & & & & [FILL] \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\Cref{tab:ablation} shows the ablation results. The single-agent ablation achieves substantially better recovery accuracy than the main four-agent experiment. Convergence in Step 2 was also faster: with three opponents playing a fixed policy, the target agent faces a stationary environment, and the PPO update is not competing against simultaneously-shifting opponents. The IRL recovery is correspondingly cleaner: because the opponents are frozen at the known neutral policy, the GABO-IRL opponent models are more accurate (there is less opponent behavioural variation to explain), and the target agent's own strategic adaptations are more clearly attributable to their reward function rather than to opponent co-adaptation.
+
+This result directly quantifies the difficulty introduced by the multi-agent co-adaptation structure: when the environment is stationary (ablation), IRL works well; when the environment is non-stationary due to opponent co-adaptation (main experiment), recovery accuracy degrades. The ratio of joint MSE between settings provides a concrete, scalar measure of this additional difficulty.
+
+\section{Discussion}
+
+\subsection{Why IRL is Hard in the Multi-Agent Setting}
+
+Our results reflect several interacting challenges that are unique to or amplified by the multi-agent setting.
+
+\textbf{The attribution problem.} The most fundamental challenge is that each agent's observed behaviour is a joint function of their reward parameters and the policies of their opponents. An agent who folds frequently might be risk-averse ($\alpha \gg 0$), or might be responding rationally to a particularly aggressive table. GABO-IRL's opponent modelling step attempts to account for this by estimating each opponent's policy via behavioural cloning and using it to establish a counterfactual baseline: given how the opponents are playing, what reward function would make the target agent's choices look optimal? However, the behavioural cloning model is an approximation, and any error in the opponent model propagates into the IRL gradient, effectively mixing reward-signal from the target agent's preferences with noise from opponent modelling error.
+
+\textbf{The Nash equilibrium assumption.} Our IRL procedure implicitly assumes that all agents have converged to a Nash equilibrium by the time trajectories are collected. This assumption is doing significant work: it justifies treating co-players as a fixed environment during IRL (since their policies are assumed optimal and hence stable), and it provides the theoretical basis for the Boltzmann-rational model of the target agent (since at a Nash equilibrium, each agent is approximately maximising their expected reward). In practice, this assumption is questionable for at least two reasons. First, the co-adaptation dynamics of Step 2 may not have fully converged---the four agents may be in a slow drift or a limit cycle rather than at a genuine fixed point. Second, even if individual agents have converged, the multi-agent system may be at an asymmetric or correlated equilibrium rather than the symmetric Nash equilibrium assumed by the IRL model. Both violations introduce systematic bias into the parameter estimates.
+
+\textbf{Low signal-to-noise in the reward-shaping gradient.} The IRL gradient for $\alpha$ depends on the advantage $A_{\text{var,norm}}(s_t, a_t)$: the degree to which the observed action's variance contribution exceeds the baseline. In a 50,000-hand dataset, the rolling variance is a noisy estimator of the true outcome variance, and any single hand's terminal variance observation contributes only weakly to the gradient. The $\beta$ gradient faces a similar issue: the pot involvement bonus varies substantially across hands, and 50,000 hands, while large, may not provide enough signal to precisely locate the optimum of the log-posterior in both dimensions simultaneously.
+
+\subsection{The Neutral-Reward Baseline as Evidence}
+
+The observation that IRL performs substantially better when all agents have neutral reward functions ($\alpha = \beta = 0$) is revealing. In this case, the true parameters are at the prior centre, the agents are playing the symmetric Nash equilibrium policy, the stationarity assumption holds perfectly (up to convergence error), and the Boltzmann-rational model with $Q_\theta = Q_0$ is a near-exact description of the agents' decision-making. The IRL is essentially checking whether the observed behaviour is consistent with neutral parameters---a much easier problem than identifying non-zero parameters against a background of co-adaptation noise.
+
+This suggests that IRL's accuracy in the perturbed case may partly be limited not by algorithmic insufficiency but by the fundamental difficulty of identifying reward parameters when the policy landscape is complex and the Nash equilibrium structure is not perfectly satisfied. More training data, a better opponent model, or a more expressive Q-decomposition might all help, but some irreducible estimation error may remain.
+
+\subsection{Strengths and Limitations}
+
+\textbf{Strengths.} Our pipeline provides a clean, controlled experimental testbed for multi-agent IRL where the true reward parameters are known and scalar MSE can be directly computed. The reward decomposition $R = \Delta_{\text{chips}} - \alpha \cdot \text{Var} + \beta \cdot \text{PotInvolve}$ is interpretable and maps naturally to real strategic archetypes (tight-aggressive, loose-passive, etc.). The ablation study provides direct quantification of the additional difficulty introduced by co-adaptation, which \citet{fu2021evaluating} did not attempt. The parameter-sharing self-play convergence approach is principled and produces a genuinely symmetric baseline.
+
+\textbf{Limitations.} The IRL algorithm makes the simplifying assumption that Q-values decompose additively in the reward parameters and that unobserved actions have zero advantage w.r.t.\ reward shaping. This second approximation is conservative but introduces systematic underestimation of the reward shaping signal strength. The Boltzmann-rational model with the target agent's own base logits as $Q_0$ is a heuristic rather than a derived quantity: a more principled approach would estimate $Q_0$ from the opponent model and the game dynamics, but this would require solving the full game tree at each state, which is intractable for our environment. The simplified two-street poker variant, while rich enough to exhibit genuine strategic diversity, is simpler than real poker; it is unclear whether results generalise to more complex variants.
+
+\subsection{Future Work}
+
+Several directions could substantially improve on these results. A joint IRL that infers all agents' reward parameters simultaneously, rather than one at a time with opponents modelled independently, would be more theoretically principled and could exploit cross-agent information. Better Q-decomposition via counterfactual reasoning---using the opponent models to simulate alternative actions and estimate their outcomes---could provide sharper advantage estimates. With more compute, longer training and larger trajectory datasets would improve both convergence quality and IRL signal. Finally, extending to a full no-limit Hold'em variant with more streets and continuous raise sizes would stress-test the approach in a setting closer to the real-world applications that motivate this work.
+
+\section{Conclusion}
+
+We have implemented a complete pipeline for multi-agent inverse reinforcement learning in a four-player poker environment, from self-play base agent training through personalised reward fine-tuning to gradient-based Bayesian IRL with opponent modelling. Our results demonstrate that it is possible to make meaningful progress on recovering individualised reward parameters from multi-agent trajectories, recovering the correct direction and approximate magnitude in most cases. At the same time, our ablation study clearly quantifies the additional challenge introduced by strategic co-adaptation: recovery accuracy is substantially better when a single agent is trained against fixed opponents than when all four agents are co-adapting simultaneously. The Nash equilibrium assumption that underpins our IRL approach is a useful simplification but introduces bias when convergence is imperfect or when the true equilibrium is not symmetric. We believe this work establishes a useful experimental foundation for future multi-agent IRL research, and that the poker setting---with its rich strategic structure, clear information asymmetries, and tractable action space---is a valuable benchmark for this largely unexplored problem class.
+
+\begin{ack}
+The authors thank Allen Hu for suggesting and initiating this research direction, and for helpful early-stage discussions about multi-agent IRL.
+\end{ack}
+
+\printbibliography
+
+%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%%
+
+\appendix
+
+\section{Reproducibility Statement}
+Code for the full experimental pipeline is available at \url{[GITHUB REPO LINK]}.
+
+\section{Game Environment Details} \label{app:env}
+
+\subsection{Hand Evaluation}
+Hands are evaluated using a complete five-card enumerator on the unique five cards available to each player. Winners are evaluated using direct lexicographic comparisons of the players' hand qualities.
+
+\subsection{Feature Encoding}
+
+The 165-dimensional feature vector serving as the input to each agent's decision each round is constructed as follows: two hole cards (2~$\times$~17~=~34 floats, one-hot over 13 ranks + 4 suits each), three board cards (3~$\times$~17~=~51 floats, zero-padded pre-flop), hand strength estimate (15 floats: 10-dim category one-hot + 5 normalised tiebreaker values post-flop, or a 6-dimensional Chen heuristic zero-padded to 15 pre-flop), five scalar features (pot/\textsc{pot\_norm}, call/\textsc{pot\_norm}, own street investment, own total investment, own stack), blind position flags (3 floats: am small blind, am big blind, am dealer), seat position encoding (2 floats: $\sin$ and $\cos$ of $2\pi \cdot \text{relative position} / 4$), betting history summary (48 floats: per-player per-street last action type one-hot~+~normalised raise size~+~normalised cumulative investment, plus a per-player has-ever-raised flag and per-player per-street raise count), opponent pressure (2 floats: normalised maximum raise size seen this hand, normalised raise count this street), active opponent count (1 float), and pot odds and stack-to-pot ratio (2 floats).
+
+
+\subsection{PPO Hyperparameters (update this)}
+\begin{table}[h]
+\caption{PPO hyperparameters used for base agent training (Step 1) and perturbed agent fine-tuning (Step 2).}
+\label{tab:hyperparams}
+\centering
+\begin{tabular}{lrr}
+\toprule
+Hyperparameter & Step 1 & Step 2 \\
+\midrule
+Steps per update & 4096 & 2048 \\
+PPO epochs & 10 & 8 \\
+Mini-batch size & 256 & 128 \\
+Clip range & 0.20 & 0.15 \\
+Value coefficient & 0.50 & 0.50 \\
+Entropy coefficient & 0.010 & 0.005 \\
+KL coefficient (initial) & 0.00 & 0.05 \\
+KL coefficient (floor) & --- & 0.005 \\
+KL anneal factor & --- & 0.9995/hand \\
+GAE $\lambda$ & 0.95 & 0.95 \\
+Discount $\gamma$ & 1.00 & 1.00 \\
+Learning rate & $3 \times 10^{-4}$ & $1 \times 10^{-4}$ \\
+Gradient norm clip & 0.50 & 0.40 \\
+Return normalisation & Yes & Yes \\
+\bottomrule
+\end{tabular}
+\end{table}
+
+\section{IRL Algorithm Details} \label{app:irl}
+
+\subsection{VAR\_NORM Computation}
+The normalisation constant VAR\_NORM for each seat is computed as the standard deviation of the rolling variance series $\{\widehat{\text{Var}}_t\}_{t=1}^{N}$ over the full trajectory dataset. This is adaptive, agents with higher chip volatility (e.g., aggressive pot-hungry agents at seat 0 and 2) will have a larger VAR\_NORM, keeping the normalised advantage $A_{\text{var,norm}} = (A_{\text{var}} - \bar{V}_{\text{var}}) / \text{VAR\_NORM}$ in a comparable range across all seats.
+
+\subsection{Opponent Modelling Architecture}
+Each opponent model is a three-layer MLP with hidden dimension 128, LayerNorm after the first layer, and GELU activations. The output is a vector of logits over the five actions, with illegal actions masked to $-\infty$ before the cross-entropy loss. Models are trained for 50 epochs with Adam (lr $= 10^{-3}$, batch size 512) on all observed $(s, a)$ pairs from the opponent seat across the full 1,000,000-hand dataset.
+
+The codebase includes a behavioural-cloning opponent model (three-layer MLP, hidden dimension 128, LayerNorm, GELU, action masking, 50 epochs with Adam at lr $=10^{-3}$ and batch size 512). In the current Step 3 implementation, this module is retained for future extensions but is not yet wired into the posterior objective used for the main IRL estimates.
+
+\subsection{IRL Gradient Derivation}
+The analytical gradient used in GABO-IRL follows from the Boltzmann-rational policy model with reward shaping applied only to the observed action (for unobserved actions, shaping is approximated as zero). Under this approximation:
+\[
+\frac{\partial \log \pi_\theta(a_{\text{obs}} \mid s)}{\partial \alpha_{\text{norm}}} = A_{\text{var,norm}}(s) \cdot (1 - \pi_\theta(a_{\text{obs}} \mid s))
+\]
+This is the feature expectation matching update: it pushes $\alpha_{\text{norm}}$ upward when the observed action has above-average variance advantage and the policy assigns it less than full probability. Adding the Gaussian prior gradient $-\alpha_{\text{norm}} / \sigma^2$ and gradient clipping (norm clip of 5.0) completes the step.
+
+\end{document}

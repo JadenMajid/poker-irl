@@ -343,7 +343,7 @@ def compute_reward_stateless(
     return (
         chip_delta
         - params.alpha * rolling_var
-        + params.beta  * (max_pot / POT_NORM)
+        + params.beta  * max_pot
     )
 
 
@@ -356,13 +356,13 @@ def reward_gradient_wrt_params(
     Gradient of the reward with respect to (alpha, beta).
 
         dR/d_alpha = -rolling_var
-        dR/d_beta  =  max_pot / POT_NORM
+        dR/d_beta  =  max_pot
 
     Returns a (2,) numpy array.  Useful for gradient-based IRL.
     """
     return np.array([
         -rolling_var,
-        max_pot / POT_NORM,
+        max_pot,
     ], dtype=np.float64)
 
 

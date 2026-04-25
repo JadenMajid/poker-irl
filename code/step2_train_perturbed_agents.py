@@ -96,7 +96,7 @@ PARALLEL_UPDATE_WORKERS = max(1, int(os.getenv("STEP2_PARALLEL_UPDATE_WORKERS", 
 HIDDEN_DIM     = 256
 LOG_EVERY      = 1_000
 SAVE_EVERY     = 50_000
-MAX_HANDS      = 10_000_000
+MAX_HANDS      = 5_000_000
 
 # ── Mini-batch hand accumulation ──────────────────────────────────────────
 # Number of complete hands each agent accumulates before writing transitions
@@ -104,7 +104,7 @@ MAX_HANDS      = 10_000_000
 # commit, smoothing the gradient signal and reducing trendline volatility.
 # Each of the 4 agents maintains its OWN accumulator independently; they
 # commit and update at different wall-clock moments as their buffers fill.
-HANDS_PER_MINI_BATCH: int = 256
+HANDS_PER_MINI_BATCH: int = 1024
 
 # When True, terminal rewards within each per-agent mini-batch are
 # standardised (zero-mean / unit-variance) before buffer commit.  This is
@@ -138,8 +138,8 @@ REWARD_PARAMS = [
 # ── PPO config for fine-tuning ─────────────────────────────────────────────
 # Smaller LR and more conservative clip range than base training
 FINETUNE_PPO_CFG = PPOConfig(
-    n_steps_per_update=4096,
-    n_epochs=8,
+    n_steps_per_update=256,
+    n_epochs=2,
     mini_batch_size=256,
     clip_range=0.15,
     value_clip_range=0.15,
@@ -148,11 +148,11 @@ FINETUNE_PPO_CFG = PPOConfig(
     kl_coef=0.02,          # initial KL penalty (annealed below)
     gae_lambda=0.95,
     gamma=1.0,
-    learning_rate=1e-4,    # smaller than base training
-    max_grad_norm=0.4,
-    convergence_window=15000,
-    convergence_threshold=2e-4,
-    min_hands_before_convergence_check=40_000,
+    learning_rate=1e-3,    # smaller than base training
+    max_grad_norm=1,
+    convergence_window=20000,
+    convergence_threshold=1e-2,
+    min_hands_before_convergence_check=1000,
     use_lr_schedule=True,
     lr_schedule_T_max=1_200_000,
 )
@@ -162,9 +162,9 @@ KL_ANNEAL_FACTOR = 0.9995   # multiply kl_coef every hand
 KL_FLOOR         = 0.005
 
 # Convergence parameters
-CONV_THRESHOLD  = 1.0e-3
-CONV_MIN_HANDS  = 40_000
-CONV_CHECK_EVERY= 100
+CONV_THRESHOLD  = 1.0e-2
+CONV_MIN_HANDS  = 500
+CONV_CHECK_EVERY= 1000
 CONV_WINDOW     = 15000
 
 # ---------------------------------------------------------------------------

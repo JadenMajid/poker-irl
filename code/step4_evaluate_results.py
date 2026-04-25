@@ -63,6 +63,7 @@ from step3_collect_and_run_irl import (
     compute_rolling_variance_penalties,
     compute_mc_returns_per_hand,
     fill_var_penalties,
+    IRLOptimiser,
     CHECKPOINT_DIR,
     IRL_DIR,
     DEVICE,
@@ -93,46 +94,33 @@ def compute_holl_for_seat(
     alpha:       float,
     beta:        float,
     var_norm:    float,
-    V_var:       float,
-    V_pot:       float,
     device:      torch.device,
+    S:           float,
 ) -> float:
     """
-    Compute mean held-out log-likelihood for one set of reward parameters.
-
-    For each hand's terminal step:
-        log π_θ(a_obs | s) = Q_θ(s, a_obs) - log Σ_{a'} exp(Q_θ(s, a'))
-
-    where Q_θ(s, a_obs) = Q₀(s, a_obs) + alpha_norm × A_var_norm + beta × A_pot
-    and for unobserved actions, shaping ≈ 0 (same approximation as in IRL).
-
-    alpha_norm = alpha × var_norm  (convert true alpha to normalised space)
+    Compute mean held-out log-likelihood using the exact same feature extraction
+    and logit-shifting logic as the IRLOptimiser.
     """
-    alpha_norm = alpha * var_norm
-    total_ll   = 0.0
-    n          = 0
+    if not step_data:
+        return 0.0
 
-    for feats, masks, acts, returns in step_data:
-        feat_t = torch.tensor(feats[-1:], dtype=torch.float32, device=device)
-        mask_t = torch.tensor(masks[-1:], dtype=torch.bool,    device=device)
-        a_obs  = int(acts[-1])
+    opt = IRLOptimiser(
+        target_seat=-1,  # dummy seat
+        step_data=step_data,
+        opponent_models={},
+        target_network=target_net,
+        device=device,
+        var_norm=var_norm,
+        S=max(S, 1.0),
+    )
 
-        with torch.no_grad():
-            base_logits, _ = target_net(feat_t, mask_t)
+    with torch.no_grad():
+        opt.theta[0] = alpha
+        opt.theta[1] = beta
+        idx = torch.arange(opt.n_states, device=device)
+        _, ll = opt._posterior_objective(idx)
 
-        adj    = base_logits[0].clone().float()
-        A_vn   = (float(returns[-1, 1]) - V_var) / max(var_norm, 1.0)
-        A_pot  = float(returns[-1, 2]) - V_pot
-        shaping = alpha_norm * A_vn + beta * A_pot
-        adj[a_obs] = adj[a_obs] + shaping
-
-        legal  = mask_t[0]
-        log_z  = torch.logsumexp(adj[legal], dim=0)
-        ll     = (adj[a_obs] - log_z).item()
-        total_ll += ll
-        n        += 1
-
-    return total_ll / max(n, 1)
+    return float(ll.item())
 
 
 def compute_random_holl(step_data: List[Tuple]) -> float:
@@ -204,6 +192,11 @@ def run_evaluation(
     )
     mc_held = compute_mc_returns_per_hand(held_records, var_ph_held)
 
+    chip_std_train: Dict[int, float] = {}
+    for seat in range(NUM_PLAYERS):
+        deltas = [r.chip_deltas.get(seat, 0.0) for r in train_records]
+        chip_std_train[seat] = max(float(np.std(deltas)) if len(deltas) > 1 else 1.0, 1.0)
+
     # ── Load true parameters ───────────────────────────────────────────────
     params_key  = "ablation_agent_params.json" if is_ablation else "perturbed_agent_params.json"
     params_path = os.path.join(CHECKPOINT_DIR, params_key)
@@ -260,15 +253,15 @@ def run_evaluation(
         # HOLL under four parameter settings
         holl_est = compute_holl_for_seat(
             held_d, target_net, α_hat,   β_hat,   var_norm,
-            V_var_train, V_pot_train, device
+            device, chip_std_train[seat]
         )
         holl_true = compute_holl_for_seat(
             held_d, target_net, α_true,  β_true,  var_norm,
-            V_var_train, V_pot_train, device
+            device, chip_std_train[seat]
         )
         holl_neutral = compute_holl_for_seat(
             held_d, target_net, 0.0, 0.0, var_norm,
-            V_var_train, V_pot_train, device
+            device, chip_std_train[seat]
         )
         holl_random = compute_random_holl(held_d)
 
