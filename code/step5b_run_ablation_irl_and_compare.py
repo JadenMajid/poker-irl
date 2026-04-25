@@ -233,19 +233,23 @@ def run_ablation_comparison() -> None:
     target_seat  = 0
     true_alpha, true_beta = abl_params_map[target_seat]
 
-    # ── Step 4: Load ablation agent network ───────────────────────────────
-    abl_net_path = os.path.join(CHECKPOINT_DIR, "ablation_perturbed_agent_0.pt")
-    ckpt = torch.load(abl_net_path, map_location=device)
+    # ── Step 4: Load neutral base policy as Q₀ ────────────────────────────
+    #   Same as step3: logit_base = neutral base network.
+    base_net_path = os.path.join(CHECKPOINT_DIR, "base_agent.pt")
+    if not os.path.exists(base_net_path):
+        raise FileNotFoundError(f"Base agent not found: {base_net_path}")
+    base_ckpt = torch.load(base_net_path, map_location=device)
     target_net = ActorCriticNetwork(
-        input_dim=ckpt.get("feature_dim", FEATURE_DIM),
-        hidden_dim=ckpt.get("hidden_dim",  HIDDEN_DIM),
+        input_dim=base_ckpt.get("feature_dim", FEATURE_DIM),
+        hidden_dim=base_ckpt.get("hidden_dim",  HIDDEN_DIM),
     ).to(device)
-    target_net.load_state_dict(ckpt["network_state"])
+    target_net.load_state_dict(base_ckpt["network_state"])
     target_net.eval()
     for p in target_net.parameters():
         p.requires_grad_(False)
+    log.info("Using neutral base agent as Q₀: %s", base_net_path)
 
-    # ── Step 5: Train opponent models for the 3 fixed neutral seats ───────
+    # ── Step 6: Train opponent models for the 3 fixed neutral seats ───────
     opponent_models: Dict[int, BehaviourCloningNet] = {}
     for opp_seat in [1, 2, 3]:
         opp_data = mc_data.get(opp_seat, [])
@@ -263,7 +267,7 @@ def run_ablation_comparison() -> None:
         opp_save  = os.path.join(IRL_DIR, f"opp_model_abl_target0_opp{opp_seat}.pt")
         torch.save(opp_net.state_dict(), opp_save)
 
-    # ── Step 6: Run IRL on seat 0 ─────────────────────────────────────────
+    # ── Step 7: Run IRL on seat 0 ─────────────────────────────────────────
     log.info("\n" + "=" * 62)
     log.info("ABLATION IRL — Target seat 0")
     log.info("  (grad_accum=%d, eff. batch=%d hands — inherited from step3)",

@@ -84,9 +84,9 @@ from reward import RewardParams, RewardFunction
 CHECKPOINT_DIR = "checkpoints"
 DEVICE         = "cpu"
 HIDDEN_DIM     = 256
-LOG_EVERY      = 500
-SAVE_EVERY     = 10_000
-MAX_HANDS      = 1_000_000
+LOG_EVERY      = 1_000
+SAVE_EVERY     = 50_000
+MAX_HANDS      = 5_000_000
 
 # Number of complete hands to accumulate before each PPO update.
 # Larger values → lower gradient variance, smoother trendlines, but less
@@ -94,7 +94,7 @@ MAX_HANDS      = 1_000_000
 # a 4-player poker environment where hands average ~6 decision points each,
 # giving ~100–200 transitions per update — comparable to the original
 # n_steps_per_update=2048 but now aligned to hand boundaries.
-HANDS_PER_MINI_BATCH: int = 24
+HANDS_PER_MINI_BATCH: int = 1024
 
 # When True, rewards within each mini-batch are standardised to zero mean /
 # unit variance before being stored in the rollout buffer.  This is the
@@ -111,32 +111,32 @@ ABLATION_REWARD_PARAMS = RewardParams(alpha=0.005, beta=.3)
 
 # Fine-tuning PPO config (same as step2)
 ABLATION_PPO_CFG = PPOConfig(
-    n_steps_per_update=2048,
-    n_epochs=8,
-    mini_batch_size=128,
+    n_steps_per_update=256,
+    n_epochs=2,
+    mini_batch_size=256,
     clip_range=0.15,
     value_clip_range=0.15,
     value_coef=0.5,
     entropy_coef=0.005,
-    kl_coef=0.05,
+    kl_coef=0.02,
     gae_lambda=0.95,
     gamma=1.0,
-    learning_rate=1e-4,
-    max_grad_norm=0.4,
-    convergence_window=2000,
-    convergence_threshold=2e-4,
-    min_hands_before_convergence_check=15_000,
+    learning_rate=1e-3,
+    max_grad_norm=1,
+    convergence_window=20000,
+    convergence_threshold=1e-2,
+    min_hands_before_convergence_check=1000,
     use_lr_schedule=True,
-    lr_schedule_T_max=900_000,
+    lr_schedule_T_max=1_200_000,
 )
 
 KL_ANNEAL_FACTOR = 0.9995
 KL_FLOOR         = 0.005
 
-CONV_THRESHOLD   = 1e-3
-CONV_MIN_HANDS   = 15_000
+CONV_THRESHOLD   = 1.0e-2
+CONV_MIN_HANDS   = 500
 CONV_CHECK_EVERY = 1000
-CONV_WINDOW      = 2000
+CONV_WINDOW      = 15000
 
 # ---------------------------------------------------------------------------
 logging.basicConfig(

@@ -95,7 +95,6 @@ def compute_holl_for_seat(
     beta:        float,
     var_norm:    float,
     device:      torch.device,
-    S:           float,
 ) -> float:
     """
     Compute mean held-out log-likelihood using the exact same feature extraction
@@ -111,16 +110,14 @@ def compute_holl_for_seat(
         target_network=target_net,
         device=device,
         var_norm=var_norm,
-        S=max(S, 1.0),
     )
 
     with torch.no_grad():
         opt.theta[0] = alpha
         opt.theta[1] = beta
-        idx = torch.arange(opt.n_states, device=device)
-        _, ll = opt._posterior_objective(idx)
+        _, ll = opt._compute_gradient(step_data)
 
-    return float(ll.item())
+    return float(ll)
 
 
 def compute_random_holl(step_data: List[Tuple]) -> float:
@@ -220,17 +217,13 @@ def run_evaluation(
         log.info("  Est:   α=%.5f   β=%.4f", α_hat,  β_hat)
         log.info("  VAR_NORM=%.0f", var_norm)
 
-        # Load agent network
-        agent_path = (
-            os.path.join(CHECKPOINT_DIR, "ablation_perturbed_agent_0.pt")
-            if is_ablation
-            else os.path.join(CHECKPOINT_DIR, f"perturbed_agent_{seat}.pt")
-        )
-        if not os.path.exists(agent_path):
-            log.warning("  Agent checkpoint missing: %s", agent_path)
+        # Load neutral base agent as Q₀ (same as step3)
+        base_path = os.path.join(CHECKPOINT_DIR, "base_agent.pt")
+        if not os.path.exists(base_path):
+            log.warning("  Base agent checkpoint missing: %s", base_path)
             continue
 
-        ckpt = torch.load(agent_path, map_location=device)
+        ckpt = torch.load(base_path, map_location=device)
         target_net = ActorCriticNetwork(
             input_dim=ckpt.get("feature_dim", FEATURE_DIM),
             hidden_dim=ckpt.get("hidden_dim",  HIDDEN_DIM),
@@ -252,16 +245,13 @@ def run_evaluation(
 
         # HOLL under four parameter settings
         holl_est = compute_holl_for_seat(
-            held_d, target_net, α_hat,   β_hat,   var_norm,
-            device, chip_std_train[seat]
+            held_d, target_net, α_hat,   β_hat,   var_norm, device,
         )
         holl_true = compute_holl_for_seat(
-            held_d, target_net, α_true,  β_true,  var_norm,
-            device, chip_std_train[seat]
+            held_d, target_net, α_true,  β_true,  var_norm, device,
         )
         holl_neutral = compute_holl_for_seat(
-            held_d, target_net, 0.0, 0.0, var_norm,
-            device, chip_std_train[seat]
+            held_d, target_net, 0.0, 0.0, var_norm, device,
         )
         holl_random = compute_random_holl(held_d)
 

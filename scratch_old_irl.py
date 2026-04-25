@@ -122,7 +122,7 @@ DEVICE         = "cpu"
 HIDDEN_DIM     = 256
 
 # Trajectory collection
-N_COLLECTION_HANDS = 5_000
+N_COLLECTION_HANDS = 50_000
 LOG_COLLECT_EVERY  = 5_000
 
 # Number of parallel worker processes for trajectory collection.
@@ -143,9 +143,9 @@ OPP_BATCH_SIZE  = 512
 OPP_MIN_SAMPLES = 200
 
 # IRL gradient ascent
-IRL_LR          = 0.0002     # LR for (alpha, beta)
+IRL_LR          = 0.02      # LR for (alpha, beta)
 IRL_N_STEPS     = 5_000     # max gradient steps per agent
-IRL_BATCH_SIZE  = 1024       # hands sampled per gradient step
+IRL_BATCH_SIZE  = 256       # hands sampled per gradient step
 IRL_PRIOR_SIGMA = 1.0       # Gaussian prior std (in normalised space)
 IRL_GRAD_CLIP   = 5.0       # gradient norm clip for stability
 IRL_LOG_EVERY   = 100
@@ -161,7 +161,7 @@ IRL_LOG_EVERY   = 100
 #
 # Effective batch size = IRL_BATCH_SIZE × IRL_GRAD_ACCUM_STEPS hands.
 # Set to 1 to restore the original single-step behaviour.
-IRL_GRAD_ACCUM_STEPS: int = 8
+IRL_GRAD_ACCUM_STEPS: int = 4
 
 # Convergence (gradient steps)
 CONV_WINDOW     = 300
@@ -633,32 +633,37 @@ class IRLOptimiser:
     """
     Gradient-ascent Bayesian IRL for recovering (alpha, beta) of one target seat.
 
-    Implements the paper's Eq. §3.4 with action-dependent features:
+    Parameterisation for numerical stability
+    ----------------------------------------
+    We optimise (alpha, beta) directly, but with a normalised variance feature:
 
-        logit_θ(s, a) = logit_base(s, a) − α·φ_α(s, a) + β·φ_β(s, a)
+        A_var_norm = (rolling_var - V_var) / VAR_NORM
 
-    where:
-        φ_α(s, a) = (commitment(a) / COMMIT_NORM)²   (risk proxy)
-        φ_β(s, a) = pot_after(a) / POT_NORM            (pot involvement proxy)
+    so alpha remains in true units while the feature scale is O(1).
 
-    These are action-dependent: fold→0, call→moderate, raise→high.
-    Shaping is applied to ALL legal actions, and the gradient is the standard
-    feature-expectation matching:
+    VAR_NORM is computed per-dataset as the standard deviation of the rolling
+    variance series, making it adaptive to the actual chip volatility.
 
-        ∂ℒ/∂β = φ_β(s, a_obs) − Σ_{a'} π_θ(a'|s) φ_β(s, a')
+    Gradient computation
+    --------------------
+    For each hand's terminal step (s_T, a_T):
 
-    All decision steps (not just terminal) contribute to the gradient.
+        Q_θ(s_T, a_obs) = Q₀(s_T, a_obs)
+                + alpha × A_var_norm(s_T)
+                + beta  × A_pot(s_T)
+
+    where both features are O(-1, 1):
+        A_var_norm = (rolling_var - V_var) / VAR_NORM
+        A_pot      = (pot/POT_NORM) - V_pot
+
+    Log-likelihood gradient (feature expectation matching):
+        ∂ℒ/∂alpha      = A_var_norm × (1 - π_θ(a_obs|s))
+        ∂ℒ/∂beta       = A_pot      × (1 - π_θ(a_obs|s))
+
+    Gaussian prior:
+        ∂log p(θ)/∂alpha      = -alpha / σ²
+        ∂log p(θ)/∂beta       = -beta       / σ²
     """
-
-    # Feature indices in the 165-dim feature vector
-    FEAT_IDX_POT  = 102   # obs.pot / POT_NORM
-    FEAT_IDX_CALL = 103   # obs.call_amount / POT_NORM
-
-    # Raise amounts for actions [fold, call, raise_20, raise_100, raise_500]
-    RAISE_AMOUNTS = [0.0, 0.0, 20.0, 100.0, 500.0]
-
-    # Normalisation for the commitment-squared feature
-    COMMIT_NORM = 500.0   # max raise size
 
     def __init__(
         self,
@@ -682,6 +687,7 @@ class IRLOptimiser:
         self.grad_accum_steps = max(1, grad_accum_steps)
 
         # Parameters: [alpha, beta] in true parameter space.
+        # Variance feature is normalised, so gradients stay well-scaled.
         self.theta = nn.Parameter(
             torch.zeros(2, dtype=torch.float64, device=device)
         )
@@ -693,55 +699,39 @@ class IRLOptimiser:
         self.ll_history:         List[float] = []
 
         # Gradient accumulation state
+        # _accum_grad holds the running sum; _accum_ll holds the sum of
+        # mean log-likelihoods across accumulation steps.
         self._accum_grad: Optional[torch.Tensor] = None
         self._accum_ll:   float = 0.0
         self._accum_count: int  = 0
 
+        self._precompute_baselines()
+
+    # ------------------------------------------------------------------
+    # Baseline computation
+    # ------------------------------------------------------------------
+
+    def _precompute_baselines(self) -> None:
+        """
+        Compute V_var (mean rolling variance) and V_pot (mean pot involvement)
+        as control variates to reduce gradient variance.
+        These are means over the dataset — they cancel in expectation and only
+        reduce variance without introducing bias.
+        """
+        var_vals = [d[3][-1, 1] for d in self.step_data]   # rolling_var at terminal
+        pot_vals = [d[3][-1, 2] for d in self.step_data]   # pot/POT_NORM at terminal
+
+        self.V_var = float(np.mean(var_vals)) if var_vals else 0.0
+        self.V_pot = float(np.mean(pot_vals)) if pot_vals else 0.0
+
+        # Normalised baseline (in reparametrised space)
+        self.V_var_norm = self.V_var / self.var_norm
+
         log.info(
-            "    Seat %d: %d hands, VAR_NORM=%.0f",
-            self.seat, len(self.step_data), self.var_norm,
+            "    Seat %d baselines: V_var=%.0f  VAR_NORM=%.0f  "
+            "V_var_norm=%.4f  V_pot=%.4f",
+            self.seat, self.V_var, self.var_norm, self.V_var_norm, self.V_pot,
         )
-
-    # ------------------------------------------------------------------
-    # Action-dependent feature computation
-    # ------------------------------------------------------------------
-
-    def _action_features(self, feat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Compute per-action features φ_α(s,a) and φ_β(s,a) for all 5 actions.
-
-        Returns:
-            phi_alpha: shape (5,) — risk feature per action
-            phi_beta:  shape (5,) — pot-involvement feature per action
-        """
-        pot_norm  = float(feat[self.FEAT_IDX_POT])    # pot / POT_NORM
-        call_norm = float(feat[self.FEAT_IDX_CALL])   # call_amount / POT_NORM
-
-        # Recover raw values (approximate — POT_NORM = 2000)
-        call_raw = call_norm * POT_NORM
-
-        phi_alpha = np.zeros(NUM_ACTIONS, dtype=np.float64)
-        phi_beta  = np.zeros(NUM_ACTIONS, dtype=np.float64)
-
-        for a_idx in range(NUM_ACTIONS):
-            if a_idx == 0:
-                # Fold: zero commitment, zero pot involvement
-                commitment = 0.0
-                pot_after  = 0.0
-            elif a_idx == 1:
-                # Call: commit call_amount, pot involvement = current pot
-                commitment = call_raw
-                pot_after  = pot_norm * POT_NORM + call_raw
-            else:
-                # Raise: commit call + raise_amount
-                raise_amt  = self.RAISE_AMOUNTS[a_idx]
-                commitment = call_raw + raise_amt
-                pot_after  = pot_norm * POT_NORM + commitment
-
-            phi_alpha[a_idx] = (commitment / self.COMMIT_NORM) ** 2
-            phi_beta[a_idx]  = pot_after / POT_NORM
-
-        return phi_alpha, phi_beta
 
     # ------------------------------------------------------------------
     # Gradient computation
@@ -751,15 +741,11 @@ class IRLOptimiser:
         """
         Compute gradient of log p(theta|data) w.r.t. theta = (alpha, beta).
 
-        Uses ALL decision steps in each hand (not just terminal).
-        For each step, computes action-dependent features φ_α(s,a) and φ_β(s,a)
-        and applies the full feature-expectation matching gradient:
-
-            ∂ℒ/∂α = -[φ_α(s, a_obs) - Σ_a' π_θ(a'|s) φ_α(s, a')]
-            ∂ℒ/∂β =   φ_β(s, a_obs) - Σ_a' π_θ(a'|s) φ_β(s, a')
+        Only processes the terminal step of each hand (where reward signal is
+        non-zero).  Intermediate steps contribute zero gradient (see docstring).
         """
-        alpha_val = float(self.theta[0].item())
-        beta_val  = float(self.theta[1].item())
+        alpha = self.theta[0]   # scalar Parameter, float64
+        beta       = self.theta[1]
 
         total_ll   = 0.0
         g_alpha    = 0.0
@@ -767,46 +753,41 @@ class IRLOptimiser:
         n          = 0
 
         for feats, masks, acts, returns in batch:
-            n_steps = len(acts)
+            # ── Terminal step only ──────────────────────────────────────
+            feat_t = torch.tensor(feats[-1:], dtype=torch.float32, device=self.device)
+            mask_t = torch.tensor(masks[-1:], dtype=torch.bool,    device=self.device)
+            a_obs  = int(acts[-1])
 
-            for t in range(n_steps):
-                feat_t = torch.tensor(feats[t:t+1], dtype=torch.float32, device=self.device)
-                mask_t = torch.tensor(masks[t:t+1], dtype=torch.bool,    device=self.device)
-                a_obs  = int(acts[t])
+            with torch.no_grad():
+                base_logits, _ = self.target_network(feat_t, mask_t)
+            # base_logits: shape (1, NUM_ACTIONS), already legal-masked
 
-                with torch.no_grad():
-                    base_logits, _ = self.target_network(feat_t, mask_t)
+            # Normalised advantages
+            raw_var  = float(returns[-1, 1])
+            raw_pot  = float(returns[-1, 2])
+            A_var_n  = (raw_var - self.V_var) / self.var_norm    # ∈ O(-1, 1)
+            A_pot    = raw_pot  - self.V_pot                      # ∈ O(-1, 1)
 
-                # Action-dependent features
-                phi_alpha, phi_beta = self._action_features(feats[t])
+            # Reward shaping on the observed action
+            #   Q_θ(s, a_obs) = Q₀(s, a_obs) + alpha * A_var_n + beta * A_pot
+            shaping = alpha.item() * A_var_n + beta.item() * A_pot
 
-                # Build adjusted logits for ALL actions:
-                #   logit_θ(s, a) = logit_base(s, a) - α·φ_α(s,a) + β·φ_β(s,a)
-                adj = base_logits[0].clone().double()
-                for a_idx in range(NUM_ACTIONS):
-                    if mask_t[0, a_idx]:
-                        adj[a_idx] += -alpha_val * phi_alpha[a_idx] + beta_val * phi_beta[a_idx]
+            adj     = base_logits[0].clone().double()
+            adj[a_obs] = adj[a_obs] + shaping
 
-                # Log-likelihood: log π_θ(a_obs | s)
-                legal = mask_t[0]
-                log_z = torch.logsumexp(adj[legal], dim=0)
-                ll    = (adj[a_obs] - log_z).item()
+            # Log-likelihood: log π_θ(a_obs | s)
+            legal = mask_t[0]
+            log_z = torch.logsumexp(adj[legal], dim=0)
+            ll    = (adj[a_obs] - log_z).item()
 
-                # Policy probabilities for all actions (for expectation)
-                log_probs = adj - log_z
-                probs = torch.zeros(NUM_ACTIONS, dtype=torch.float64, device=self.device)
-                probs[legal] = torch.exp(log_probs[legal].clamp(-30, 0))
+            # π_θ(a_obs | s) = exp(ll)
+            pi_a = float(np.exp(np.clip(ll, -30, 0)))   # clip for numerical safety
 
-                # Feature expectation matching gradient:
-                #   ∂ℒ/∂α = -[φ_α(a_obs) - Σ_a' π(a') φ_α(a')]
-                #   ∂ℒ/∂β =   φ_β(a_obs) - Σ_a' π(a') φ_β(a')
-                E_phi_alpha = float(np.dot(probs.cpu().numpy(), phi_alpha))
-                E_phi_beta  = float(np.dot(probs.cpu().numpy(), phi_beta))
-
-                g_alpha += -(phi_alpha[a_obs] - E_phi_alpha)
-                g_beta  +=  (phi_beta[a_obs]  - E_phi_beta)
-                total_ll += ll
-                n        += 1
+            # Gradient (feature expectation matching update)
+            g_alpha += A_var_n * (1.0 - pi_a)
+            g_beta  += A_pot   * (1.0 - pi_a)
+            total_ll += ll
+            n        += 1
 
         if n == 0:
             return torch.zeros(2, dtype=torch.float64, device=self.device), 0.0
@@ -816,8 +797,8 @@ class IRLOptimiser:
         ll_mean  = total_ll / n
 
         # Gaussian prior gradient
-        prior_g_alpha = -alpha_val / (self.prior_sigma ** 2)
-        prior_g_beta  = -beta_val  / (self.prior_sigma ** 2)
+        prior_g_alpha = -float(alpha.item()) / (self.prior_sigma ** 2)
+        prior_g_beta  = -float(beta.item())       / (self.prior_sigma ** 2)
 
         full_grad = torch.tensor(
             [g_alpha + prior_g_alpha, g_beta + prior_g_beta],
@@ -865,7 +846,7 @@ class IRLOptimiser:
             # Record the post-step parameter values
             alpha_n = float(self.theta[0].item())
             beta_v  = float(self.theta[1].item())
-            self.alpha_history.append(alpha_n)
+            self.alpha_norm_history.append(alpha_n)
             self.beta_history.append(beta_v)
             self.ll_history.append(avg_ll)
 
@@ -1077,31 +1058,38 @@ def run_collection_and_irl(
                         if true_params[s] != (0.0, 0.0)]
         log.info("Ablation: running IRL on seats %s only.", seats_to_run)
 
-    # ── 2a: Load neutral base policy as Q₀ (reference logits for IRL) ─────
-    #   Paper §3.4: logit_θ(s,a) = logit_base(s,a) − α·φ_α + β·φ_β
-    #   where logit_base = outputs of the frozen neutral base network.
+    # ── 2a: Load all target networks (needed for both BC and IRL) ─────────
     target_networks: Dict[int, ActorCriticNetwork] = {}
     target_net_sdicts: Dict[int, Dict]              = {}
     target_net_dims:   Dict[int, Tuple[int, int]]   = {}
 
-    base_path = os.path.join(CHECKPOINT_DIR, "base_agent.pt")
-    if not os.path.exists(base_path):
-        raise FileNotFoundError(
-            f"Neutral base agent checkpoint not found: {base_path}"
-        )
-    base_ckpt = torch.load(base_path, map_location=device)
-    base_state = base_ckpt["network_state"]
-    base_dims  = (
-        base_ckpt.get("feature_dim", FEATURE_DIM),
-        base_ckpt.get("hidden_dim",  HIDDEN_DIM),
-    )
-    log.info(
-        "Using neutral base agent as Q₀ for all seats: %s", base_path,
-    )
-
     for target_seat in seats_to_run:
-        target_net_sdicts[target_seat] = base_state
-        target_net_dims[target_seat]   = base_dims
+        if is_ablation:
+            agent_path = os.path.join(CHECKPOINT_DIR, "ablation_perturbed_agent_0.pt")
+        elif agent_paths and target_seat in agent_paths:
+            agent_path = agent_paths[target_seat]
+        else:
+            agent_path = os.path.join(CHECKPOINT_DIR, f"perturbed_agent_{target_seat}.pt")
+
+        if not os.path.exists(agent_path):
+            log.error("Agent checkpoint not found: %s", agent_path)
+            continue
+
+        ckpt = torch.load(agent_path, map_location=device)
+        net  = ActorCriticNetwork(
+            input_dim=ckpt.get("feature_dim", FEATURE_DIM),
+            hidden_dim=ckpt.get("hidden_dim",  HIDDEN_DIM),
+        ).to(device)
+        net.load_state_dict(ckpt["network_state"])
+        net.eval()
+        for p in net.parameters():
+            p.requires_grad_(False)
+        target_networks[target_seat]   = net
+        target_net_sdicts[target_seat] = ckpt["network_state"]
+        target_net_dims[target_seat]   = (
+            ckpt.get("feature_dim", FEATURE_DIM),
+            ckpt.get("hidden_dim",  HIDDEN_DIM),
+        )
 
     # ── 2b: Train all opponent BC models in parallel ───────────────────────
     # For each target seat we need BC models for the other 3 seats.

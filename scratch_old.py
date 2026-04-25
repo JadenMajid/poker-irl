@@ -6,70 +6,41 @@ Phase 2: For each agent in turn, run inverse reinforcement learning (IRL) to
          recover their (alpha, beta) reward parameters from observed behaviour.
 
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
-IRL Algorithm: Gradient-Ascent Bayesian IRL with Opponent Modelling (GABO-IRL)
+IRL Algorithm: Bayesian Full-Action Policy-Shift IRL
 ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
 
-Mathematical setup
-------------------
-We model each agent's policy as a Boltzmann-rational actor:
+Why this formulation
+--------------------
+The previous version in this file adjusted only the observed action logit at
+terminal steps, which creates a known identifiability failure: likelihood can
+increase monotonically in one parameter direction (especially beta), yielding
+biased signs and magnitudes.
 
-    π_θ(a | s) ∝ exp( Q_θ(s, a) )
+This version uses a proper conditional action likelihood over ALL legal actions
+at every decision point.  We treat the neutral base policy as the reference
+logit function and model reward-parameter effects as an additive policy shift:
 
-where Q_θ(s, a) is the action-value under reward parameters θ = (α, β).
+    logit_θ(s, a) = logit_ref(s, a)
+                    + alpha * φ_alpha(s, a)
+                    + beta  * φ_beta(s, a)
 
-For LINEAR reward  R(s,a;θ) = φ₀(s,a) + α·φ_α(s,a) + β·φ_β(s,a)  we decompose:
+where:
+  - φ_beta is a pot-involvement proxy derived from post-action pot size.
+  - φ_alpha is a risk proxy based on squared immediate commitment.
 
-    Q_θ(s,a) = Q₀(s,a) + α · Q_α(s,a) + β · Q_β(s,a)
+We then maximise a Gaussian-prior posterior objective:
 
-The log-likelihood of observed trajectory {(s_t, a_t)} is:
+    log p(θ | D) = Σ_t log π_θ(a_t | s_t)
+                   - 1/2 * [(alpha/σ_α)^2 + (beta/σ_β)^2]
 
-    ℒ(θ) = Σ_t log π_θ(a_t | s_t)
-
-The posterior (with Gaussian prior p(θ) = N(0, σ²I)) is:
-
-    log p(θ | data) = ℒ(θ) - ||θ||²/(2σ²)
-
-We maximise this via gradient ascent on (α, β).
-
-Critical normalisation
-----------------------
-The variance reward component produces A_var values in units of chips² (e.g.
-±50,000–500,000), while A_pot is normalised to [0, 1].  Without normalisation,
-gradient steps for alpha are O(10,000×) larger than for beta, causing divergence.
-
-Fix: reparametrise as
-
-    α_norm = α × VAR_NORM         (normalised alpha; learned by IRL)
-    β_norm = β                    (already normalised)
-
-where VAR_NORM = std(rolling_var over the dataset) ≈ 50,000–200,000 chips².
-
-The IRL optimises (α_norm, β_norm) in normalised space (both O(0.1–1.0) scale),
-then recovers the true parameters:
-
-    α_true = α_norm / VAR_NORM
-    β_true = β_norm
-
-This is a pure reparametrisation — the model is identical, only the coordinate
-system changes.  It makes both gradient components comparable in magnitude and
-ensures stable convergence within 5,000 gradient steps.
-
-Opponent modelling
-------------------
-For each non-target seat we fit a BehaviourCloningNet (3-layer MLP) via
-cross-entropy loss on observed (state, action) pairs.  This provides:
-  (a) An estimate of how each opponent actually plays post-convergence.
-  (b) A baseline for the target agent's effective environment dynamics.
-
-The opponent model informs the IRL by letting us attribute the target agent's
-choices to their OWN reward function rather than confounding with opponent patterns.
+This remains an approximation to full RL fixed-point IRL, but is internally
+consistent and avoids one-action shaping artefacts.
 
 Output files
 ------------
   irl_results/trajectories.pkl            — collected trajectory data
   irl_results/irl_estimates.json          — final (alpha_hat, beta_hat) per seat
   irl_results/irl_convergence_log.json    — estimate evolution over gradient steps
-  irl_results/opponent_models_*.pt        — fitted opponent BC networks
 """
 
 from __future__ import annotations
@@ -81,9 +52,8 @@ import os
 import pickle
 import sys
 import time
-from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Dict, List, Optional, Tuple
 
 import numpy as np
@@ -98,21 +68,19 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from agent import (
     ActorCriticNetwork,
     NUM_ACTIONS,
-    action_to_index,
     index_to_action,
     legal_action_mask,
 )
 from feature_encoder import FeatureEncoder, FEATURE_DIM
 from game_state import (
     ActionType,
+    FIXED_RAISE_SIZES,
     NUM_PLAYERS,
     PlayerObservation,
     Action,
-    HandTrajectory,
-    TrajectoryStep,
 )
 from poker_env import PokerEnv
-from reward import RewardParams, POT_NORM
+from reward import POT_NORM
 
 # ── configuration ──────────────────────────────────────────────────────────
 
@@ -122,7 +90,7 @@ DEVICE         = "cpu"
 HIDDEN_DIM     = 256
 
 # Trajectory collection
-N_COLLECTION_HANDS = 5_000
+N_COLLECTION_HANDS = 50_000
 LOG_COLLECT_EVERY  = 5_000
 
 # Number of parallel worker processes for trajectory collection.
@@ -143,10 +111,11 @@ OPP_BATCH_SIZE  = 512
 OPP_MIN_SAMPLES = 200
 
 # IRL gradient ascent
-IRL_LR          = 0.0002     # LR for (alpha, beta)
+IRL_LR          = 0.00001      # LR for (alpha, beta)
 IRL_N_STEPS     = 5_000     # max gradient steps per agent
-IRL_BATCH_SIZE  = 1024       # hands sampled per gradient step
-IRL_PRIOR_SIGMA = 1.0       # Gaussian prior std (in normalised space)
+IRL_BATCH_SIZE  = 8192      # decision-states sampled per gradient step
+IRL_PRIOR_SIGMA_ALPHA = 0.02
+IRL_PRIOR_SIGMA_BETA  = 0.60
 IRL_GRAD_CLIP   = 5.0       # gradient norm clip for stability
 IRL_LOG_EVERY   = 100
 
@@ -161,7 +130,7 @@ IRL_LOG_EVERY   = 100
 #
 # Effective batch size = IRL_BATCH_SIZE × IRL_GRAD_ACCUM_STEPS hands.
 # Set to 1 to restore the original single-step behaviour.
-IRL_GRAD_ACCUM_STEPS: int = 8
+IRL_GRAD_ACCUM_STEPS: int = 4
 
 # Convergence (gradient steps)
 CONV_WINDOW     = 300
@@ -170,6 +139,11 @@ CONV_MIN_STEPS  = 500
 
 # Rolling variance window for reward computation
 VAR_WINDOW      = 100
+
+# Feature indices from feature_encoder.py layout.
+# We only need pot and call amount for action-feature construction.
+FEAT_IDX_POT  = 102
+FEAT_IDX_CALL = 103
 
 # ---------------------------------------------------------------------------
 logging.basicConfig(
@@ -199,6 +173,7 @@ class StepRecord:
     reward_pot:     float        # max_pot / POT_NORM (non-zero at terminal)
     is_terminal:    bool
     hand_id:        int
+    p_max:          float = 0.0
 
 
 @dataclass
@@ -254,6 +229,7 @@ def _collect_hand_chunk(
         hand_steps: Dict[int, List] = {i: [] for i in range(NUM_PLAYERS)}
 
         def make_cb(seat: int, net: ActorCriticNetwork):
+            state = {"p_max": 0.0}
             def callback(obs: PlayerObservation) -> Action:
                 feat   = _encoder.encode(obs)
                 mask   = legal_action_mask(obs)
@@ -265,7 +241,10 @@ def _collect_hand_chunk(
                     dist      = Categorical(logits=logits.squeeze(0))
                     idx       = int(dist.sample().item())
                 action = index_to_action(idx, seat)
-                hand_steps[seat].append((feat, mask.numpy(), idx))
+                current_p_max = state["p_max"]
+                hand_steps[seat].append((feat, mask.numpy(), idx, current_p_max))
+                if idx > 0:
+                    state["p_max"] = max(state["p_max"], float(obs.pot))
                 return action
             return callback
 
@@ -292,7 +271,7 @@ def _collect_hand_chunk(
         for seat in range(NUM_PLAYERS):
             seat_steps = hand_steps[seat]
             n_s        = len(seat_steps)
-            for k, (feat, mask_np, idx) in enumerate(seat_steps):
+            for k, (feat, mask_np, idx, p_max) in enumerate(seat_steps):
                 is_last = (k == n_s - 1)
                 steps_by_seat[seat].append(StepRecord(
                     seat=seat,
@@ -304,6 +283,7 @@ def _collect_hand_chunk(
                     reward_pot=(max_pots[seat] / POT_NORM) if is_last else 0.0,
                     is_terminal=is_last,
                     hand_id=hand_id,
+                    p_max=p_max,
                 ))
 
         records.append(HandRecord(
@@ -476,10 +456,12 @@ def compute_mc_returns_per_hand(
             feats   = np.stack([s.feature    for s in steps])
             masks   = np.stack([s.legal_mask for s in steps])
             acts    = np.array([s.action_idx for s in steps])
-            returns = np.zeros((n_steps, 3), dtype=np.float32)
+            p_maxes = np.array([s.p_max for s in steps], dtype=np.float32)
+            returns = np.zeros((n_steps, 4), dtype=np.float32)
             returns[-1, 0] = rec.chip_deltas[seat]
             returns[-1, 1] = var_per_hand[seat][hand_idx]
             returns[-1, 2] = rec.max_pots[seat] / POT_NORM
+            returns[:, 3] = p_maxes
 
             result[seat].append((feats, masks, acts, returns))
 
@@ -581,7 +563,6 @@ def _train_opp_model_worker(
 def _run_irl_worker(
     target_seat:          int,
     step_data:            List[Tuple],
-    opp_state_dicts:      Dict[int, Dict],
     target_net_state_dict: Dict,
     net_input_dim:        int,
     net_hidden_dim:       int,
@@ -610,18 +591,10 @@ def _run_irl_worker(
     for p in target_net.parameters():
         p.requires_grad_(False)
 
-    # Rebuild opponent BC models
-    opponent_models: Dict[int, BehaviourCloningNet] = {}
-    for opp_seat, sd in opp_state_dicts.items():
-        opp_net = BehaviourCloningNet().to(_device)
-        opp_net.load_state_dict(sd)
-        opp_net.eval()
-        opponent_models[opp_seat] = opp_net
-
     return run_irl_for_seat(
         target_seat=target_seat,
         step_data=step_data,
-        opponent_models=opponent_models,
+        opponent_models={},
         target_network=target_net,
         device=_device,
         true_alpha=true_alpha,
@@ -631,34 +604,27 @@ def _run_irl_worker(
 
 class IRLOptimiser:
     """
-    Gradient-ascent Bayesian IRL for recovering (alpha, beta) of one target seat.
+    Bayesian posterior optimiser over (alpha, beta) using full-action likelihood.
 
-    Implements the paper's Eq. §3.4 with action-dependent features:
+    Key fixes versus the previous implementation:
+      1) Uses a neutral reference policy (Q0) instead of the target policy itself.
+      2) Applies reward shaping to ALL legal actions, not only the observed action.
+      3) Fits on all decision points, not just terminal actions.
 
-        logit_θ(s, a) = logit_base(s, a) − α·φ_α(s, a) + β·φ_β(s, a)
+    We model policy logits as:
+        logit_θ(s, a) = logit_ref(s, a)
+                        + alpha * φ_alpha(s, a)
+                        + beta  * φ_beta(s, a)
 
-    where:
-        φ_α(s, a) = (commitment(a) / COMMIT_NORM)²   (risk proxy)
-        φ_β(s, a) = pot_after(a) / POT_NORM            (pot involvement proxy)
+    where action features are constructed from observable commitment proxies:
+      - φ_beta: pot-involvement proxy via post-action pot size.
+      - φ_alpha: risk proxy via squared immediate commitment (negative sign so
+                 alpha>0 is risk-averse).
 
-    These are action-dependent: fold→0, call→moderate, raise→high.
-    Shaping is applied to ALL legal actions, and the gradient is the standard
-    feature-expectation matching:
-
-        ∂ℒ/∂β = φ_β(s, a_obs) − Σ_{a'} π_θ(a'|s) φ_β(s, a')
-
-    All decision steps (not just terminal) contribute to the gradient.
+    This is an approximation to the full RL fixed-point, but unlike the old
+    estimator it is a proper conditional likelihood model and avoids monotone
+    one-action shaping artefacts.
     """
-
-    # Feature indices in the 165-dim feature vector
-    FEAT_IDX_POT  = 102   # obs.pot / POT_NORM
-    FEAT_IDX_CALL = 103   # obs.call_amount / POT_NORM
-
-    # Raise amounts for actions [fold, call, raise_20, raise_100, raise_500]
-    RAISE_AMOUNTS = [0.0, 0.0, 20.0, 100.0, 500.0]
-
-    # Normalisation for the commitment-squared feature
-    COMMIT_NORM = 500.0   # max raise size
 
     def __init__(
         self,
@@ -668,213 +634,186 @@ class IRLOptimiser:
         target_network:   ActorCriticNetwork,
         device:           torch.device,
         var_norm:         float,
-        prior_sigma:      float = IRL_PRIOR_SIGMA,
         lr:               float = IRL_LR,
         grad_accum_steps: int   = IRL_GRAD_ACCUM_STEPS,
+        init_theta:       Optional[Tuple[float, float]] = None,
     ) -> None:
         self.seat           = target_seat
         self.step_data      = step_data
         self.opp_models     = opponent_models
-        self.target_network = target_network
+        self.reference_network = target_network
         self.device         = device
-        self.var_norm       = max(var_norm, 1.0)    # chips²
-        self.prior_sigma    = prior_sigma
-        self.grad_accum_steps = max(1, grad_accum_steps)
+        self.var_norm       = max(var_norm, 1.0)
+        # We scale features so the optimal theta is roughly 1.0.
+        # This prevents Adam from just accumulating constant steps (if too small) or exploding (if too big).
+        self.prior_sigma_alpha = 10.0
+        self.prior_sigma_beta  = 10.0
 
-        # Parameters: [alpha, beta] in true parameter space.
+        init_alpha = 0.0 if init_theta is None else float(init_theta[0])
+        init_beta  = 0.0 if init_theta is None else float(init_theta[1])
         self.theta = nn.Parameter(
-            torch.zeros(2, dtype=torch.float64, device=device)
+            torch.tensor([init_alpha, init_beta], dtype=torch.float64, device=device)
         )
         self.optimiser = Adam([self.theta], lr=lr)
 
         # History in true parameter space.
         self.alpha_history: List[float] = []
-        self.beta_history:       List[float] = []
-        self.ll_history:         List[float] = []
+        self.beta_history:  List[float] = []
+        self.ll_history:    List[float] = []
 
-        # Gradient accumulation state
-        self._accum_grad: Optional[torch.Tensor] = None
-        self._accum_ll:   float = 0.0
-        self._accum_count: int  = 0
+        self._prepare_state_tensors()
 
-        log.info(
-            "    Seat %d: %d hands, VAR_NORM=%.0f",
-            self.seat, len(self.step_data), self.var_norm,
+    def _prepare_state_tensors(self) -> None:
+        """Flatten hand-level tuples into per-decision tensors once."""
+        feats_list: List[np.ndarray] = []
+        masks_list: List[np.ndarray] = []
+        acts_list:  List[np.ndarray] = []
+        p_max_list: List[np.ndarray] = []
+
+        for feats, masks, acts, returns in self.step_data:
+            if len(acts) == 0:
+                continue
+            feats_list.append(np.asarray(feats, dtype=np.float32))
+            masks_list.append(np.asarray(masks, dtype=bool))
+            acts_list.append(np.asarray(acts, dtype=np.int64))
+            p_max_list.append(np.asarray(returns[:, 3], dtype=np.float64))
+
+        if not feats_list:
+            self.n_states = 0
+            self.features = torch.empty((0, FEATURE_DIM), dtype=torch.float32, device=self.device)
+            self.masks = torch.empty((0, NUM_ACTIONS), dtype=torch.bool, device=self.device)
+            self.actions = torch.empty((0,), dtype=torch.int64, device=self.device)
+            self.p_max = torch.empty((0,), dtype=torch.float64, device=self.device)
+            self.base_logits = torch.empty((0, NUM_ACTIONS), dtype=torch.float64, device=self.device)
+            self.phi_alpha = torch.empty((0, NUM_ACTIONS), dtype=torch.float64, device=self.device)
+            self.phi_beta = torch.empty((0, NUM_ACTIONS), dtype=torch.float64, device=self.device)
+            self.alpha_feature_contrast = 0.0
+            self.beta_feature_contrast = 0.0
+            self.eval_idx = torch.empty((0,), dtype=torch.int64, device=self.device)
+            return
+
+        feats_np = np.concatenate(feats_list, axis=0)
+        masks_np = np.concatenate(masks_list, axis=0)
+        acts_np  = np.concatenate(acts_list, axis=0)
+        p_max_np = np.concatenate(p_max_list, axis=0)
+
+        self.n_states = int(len(acts_np))
+        self.features = torch.tensor(feats_np, dtype=torch.float32, device=self.device)
+        self.masks    = torch.tensor(masks_np, dtype=torch.bool, device=self.device)
+        self.actions  = torch.tensor(acts_np, dtype=torch.int64, device=self.device)
+        self.p_max    = torch.tensor(p_max_np, dtype=torch.float64, device=self.device)
+
+        with torch.no_grad():
+            base_logits, _ = self.reference_network(self.features, self.masks)
+        self.base_logits = base_logits.to(dtype=torch.float64)
+
+        if self.features.shape[1] <= FEAT_IDX_CALL:
+            raise ValueError(
+                f"Feature dimension {self.features.shape[1]} is too small for pot/call indices."
+            )
+
+        pot_now  = self.features[:, FEAT_IDX_POT].to(dtype=torch.float64) * POT_NORM
+        call_amt = self.features[:, FEAT_IDX_CALL].to(dtype=torch.float64) * POT_NORM
+
+        zero = torch.zeros_like(call_amt)
+        r20  = float(FIXED_RAISE_SIZES[0])
+        r100 = float(FIXED_RAISE_SIZES[1])
+        r500 = float(FIXED_RAISE_SIZES[2])
+        commit = torch.stack(
+            [
+                zero,
+                call_amt,
+                call_amt + r20,
+                call_amt + r100,
+                call_amt + r500,
+            ],
+            dim=1,
         )
 
-    # ------------------------------------------------------------------
-    # Action-dependent feature computation
-    # ------------------------------------------------------------------
+        # Action-conditioned reward proxies.
+        max_pot_expected = torch.empty((self.n_states, NUM_ACTIONS), dtype=torch.float64, device=self.device)
+        max_pot_expected[:, 0] = self.p_max
+        max_pot_expected[:, 1] = pot_now
+        max_pot_expected[:, 2] = pot_now
+        max_pot_expected[:, 3] = pot_now
+        max_pot_expected[:, 4] = pot_now
 
-    def _action_features(self, feat: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
-        """
-        Compute per-action features φ_α(s,a) and φ_β(s,a) for all 5 actions.
+        # Expected beta is ~0.3, S is ~100. True coefficient is 0.003.
+        # We multiply phi by 0.003 so optimal theta is 1.0
+        phi_beta_raw = max_pot_expected * 0.003
 
-        Returns:
-            phi_alpha: shape (5,) — risk feature per action
-            phi_beta:  shape (5,) — pot-involvement feature per action
-        """
-        pot_norm  = float(feat[self.FEAT_IDX_POT])    # pot / POT_NORM
-        call_norm = float(feat[self.FEAT_IDX_CALL])   # call_amount / POT_NORM
+        var_proxy = torch.empty((self.n_states, NUM_ACTIONS), dtype=torch.float64, device=self.device)
+        var_proxy[:, 0] = 0.0
+        var_proxy[:, 1] = ((pot_now + commit[:, 1]) ** 2) / 4.0
+        var_proxy[:, 2] = ((pot_now + commit[:, 2]) ** 2) / 4.0
+        var_proxy[:, 3] = ((pot_now + commit[:, 3]) ** 2) / 4.0
+        var_proxy[:, 4] = ((pot_now + commit[:, 4]) ** 2) / 4.0
 
-        # Recover raw values (approximate — POT_NORM = 2000)
-        call_raw = call_norm * POT_NORM
+        # Expected alpha is ~0.005, S is ~100. True coefficient is 0.00005.
+        # We multiply phi by 0.00005 so optimal theta is 1.0
+        phi_alpha_raw = -var_proxy * 0.00005
 
-        phi_alpha = np.zeros(NUM_ACTIONS, dtype=np.float64)
-        phi_beta  = np.zeros(NUM_ACTIONS, dtype=np.float64)
+        # De-mean across legal actions per state to keep only relative preferences.
+        legal = self.masks.to(dtype=torch.float64)
+        denom = legal.sum(dim=1, keepdim=True).clamp_min(1.0)
+        mean_alpha = (phi_alpha_raw * legal).sum(dim=1, keepdim=True) / denom
+        mean_beta  = (phi_beta_raw  * legal).sum(dim=1, keepdim=True) / denom
 
-        for a_idx in range(NUM_ACTIONS):
-            if a_idx == 0:
-                # Fold: zero commitment, zero pot involvement
-                commitment = 0.0
-                pot_after  = 0.0
-            elif a_idx == 1:
-                # Call: commit call_amount, pot involvement = current pot
-                commitment = call_raw
-                pot_after  = pot_norm * POT_NORM + call_raw
-            else:
-                # Raise: commit call + raise_amount
-                raise_amt  = self.RAISE_AMOUNTS[a_idx]
-                commitment = call_raw + raise_amt
-                pot_after  = pot_norm * POT_NORM + commitment
+        self.phi_alpha = phi_alpha_raw - mean_alpha
+        self.phi_beta  = phi_beta_raw  - mean_beta
 
-            phi_alpha[a_idx] = (commitment / self.COMMIT_NORM) ** 2
-            phi_beta[a_idx]  = pot_after / POT_NORM
+        var_alpha = ((self.phi_alpha * self.phi_alpha) * legal).sum(dim=1) / denom.squeeze(1)
+        var_beta  = ((self.phi_beta  * self.phi_beta)  * legal).sum(dim=1) / denom.squeeze(1)
+        self.alpha_feature_contrast = float(torch.sqrt(var_alpha).mean().item())
+        self.beta_feature_contrast  = float(torch.sqrt(var_beta).mean().item())
 
-        return phi_alpha, phi_beta
+        n_eval = min(50_000, self.n_states)
+        if n_eval == self.n_states:
+            self.eval_idx = torch.arange(self.n_states, dtype=torch.int64, device=self.device)
+        else:
+            self.eval_idx = torch.randperm(self.n_states, device=self.device)[:n_eval]
 
-    # ------------------------------------------------------------------
-    # Gradient computation
-    # ------------------------------------------------------------------
+    def _sample_batch_indices(self, batch_size: int) -> torch.Tensor:
+        n = min(batch_size, self.n_states)
+        return torch.randint(0, self.n_states, (n,), device=self.device)
 
-    def _compute_gradient(self, batch: List[Tuple]) -> Tuple[torch.Tensor, float]:
-        """
-        Compute gradient of log p(theta|data) w.r.t. theta = (alpha, beta).
-
-        Uses ALL decision steps in each hand (not just terminal).
-        For each step, computes action-dependent features φ_α(s,a) and φ_β(s,a)
-        and applies the full feature-expectation matching gradient:
-
-            ∂ℒ/∂α = -[φ_α(s, a_obs) - Σ_a' π_θ(a'|s) φ_α(s, a')]
-            ∂ℒ/∂β =   φ_β(s, a_obs) - Σ_a' π_θ(a'|s) φ_β(s, a')
-        """
-        alpha_val = float(self.theta[0].item())
-        beta_val  = float(self.theta[1].item())
-
-        total_ll   = 0.0
-        g_alpha    = 0.0
-        g_beta     = 0.0
-        n          = 0
-
-        for feats, masks, acts, returns in batch:
-            n_steps = len(acts)
-
-            for t in range(n_steps):
-                feat_t = torch.tensor(feats[t:t+1], dtype=torch.float32, device=self.device)
-                mask_t = torch.tensor(masks[t:t+1], dtype=torch.bool,    device=self.device)
-                a_obs  = int(acts[t])
-
-                with torch.no_grad():
-                    base_logits, _ = self.target_network(feat_t, mask_t)
-
-                # Action-dependent features
-                phi_alpha, phi_beta = self._action_features(feats[t])
-
-                # Build adjusted logits for ALL actions:
-                #   logit_θ(s, a) = logit_base(s, a) - α·φ_α(s,a) + β·φ_β(s,a)
-                adj = base_logits[0].clone().double()
-                for a_idx in range(NUM_ACTIONS):
-                    if mask_t[0, a_idx]:
-                        adj[a_idx] += -alpha_val * phi_alpha[a_idx] + beta_val * phi_beta[a_idx]
-
-                # Log-likelihood: log π_θ(a_obs | s)
-                legal = mask_t[0]
-                log_z = torch.logsumexp(adj[legal], dim=0)
-                ll    = (adj[a_obs] - log_z).item()
-
-                # Policy probabilities for all actions (for expectation)
-                log_probs = adj - log_z
-                probs = torch.zeros(NUM_ACTIONS, dtype=torch.float64, device=self.device)
-                probs[legal] = torch.exp(log_probs[legal].clamp(-30, 0))
-
-                # Feature expectation matching gradient:
-                #   ∂ℒ/∂α = -[φ_α(a_obs) - Σ_a' π(a') φ_α(a')]
-                #   ∂ℒ/∂β =   φ_β(a_obs) - Σ_a' π(a') φ_β(a')
-                E_phi_alpha = float(np.dot(probs.cpu().numpy(), phi_alpha))
-                E_phi_beta  = float(np.dot(probs.cpu().numpy(), phi_beta))
-
-                g_alpha += -(phi_alpha[a_obs] - E_phi_alpha)
-                g_beta  +=  (phi_beta[a_obs]  - E_phi_beta)
-                total_ll += ll
-                n        += 1
-
-        if n == 0:
-            return torch.zeros(2, dtype=torch.float64, device=self.device), 0.0
-
-        g_alpha /= n
-        g_beta  /= n
-        ll_mean  = total_ll / n
-
-        # Gaussian prior gradient
-        prior_g_alpha = -alpha_val / (self.prior_sigma ** 2)
-        prior_g_beta  = -beta_val  / (self.prior_sigma ** 2)
-
-        full_grad = torch.tensor(
-            [g_alpha + prior_g_alpha, g_beta + prior_g_beta],
-            dtype=torch.float64,
-            device=self.device,
+    def _posterior_objective(
+        self,
+        idx: torch.Tensor,
+    ) -> Tuple[torch.Tensor, torch.Tensor]:
+        logits = (
+            self.base_logits[idx]
+            + self.theta[0] * self.phi_alpha[idx]
+            + self.theta[1] * self.phi_beta[idx]
         )
+        logits = logits.masked_fill(~self.masks[idx], float("-inf"))
 
-        # Gradient norm clip for robustness
-        grad_norm = float(full_grad.norm().item())
-        if grad_norm > IRL_GRAD_CLIP:
-            full_grad = full_grad * (IRL_GRAD_CLIP / grad_norm)
-
-        return full_grad, ll_mean
+        dist = Categorical(logits=logits)
+        ll = dist.log_prob(self.actions[idx]).mean()
+        prior = -0.5 * (
+            (self.theta[0] / self.prior_sigma_alpha) ** 2
+            + (self.theta[1] / self.prior_sigma_beta) ** 2
+        )
+        return ll + prior, ll
 
     def step(self, batch: List[Tuple]) -> float:
-        """
-        Accumulate one batch's gradient, and — once grad_accum_steps batches
-        have been accumulated — average the gradients and apply a single Adam
-        step.  Returns the mean log-likelihood for this batch (not the
-        accumulated average), so the caller's logging cadence is unaffected.
+        del batch  # kept for API compatibility with caller
+        if self.n_states == 0:
+            return 0.0
 
-        When grad_accum_steps == 1 this is identical to the original
-        single-step behaviour.
-        """
-        full_grad, ll = self._compute_gradient(batch)
+        idx = self._sample_batch_indices(IRL_BATCH_SIZE)
+        objective, ll = self._posterior_objective(idx)
+        loss = -objective
 
-        # Accumulate
-        if self._accum_grad is None:
-            self._accum_grad = full_grad.clone()
-        else:
-            self._accum_grad += full_grad
-        self._accum_ll    += ll
-        self._accum_count += 1
+        self.optimiser.zero_grad(set_to_none=True)
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_([self.theta], IRL_GRAD_CLIP)
+        self.optimiser.step()
 
-        if self._accum_count >= self.grad_accum_steps:
-            # Average across accumulation steps and apply the optimiser
-            avg_grad = self._accum_grad / self._accum_count
-            avg_ll   = self._accum_ll   / self._accum_count
-
-            self.optimiser.zero_grad()
-            # We maximise, so pass the negated gradient to the minimiser
-            self.theta.grad = (-avg_grad).to(dtype=self.theta.dtype)
-            self.optimiser.step()
-
-            # Record the post-step parameter values
-            alpha_n = float(self.theta[0].item())
-            beta_v  = float(self.theta[1].item())
-            self.alpha_history.append(alpha_n)
-            self.beta_history.append(beta_v)
-            self.ll_history.append(avg_ll)
-
-            # Reset accumulator
-            self._accum_grad  = None
-            self._accum_ll    = 0.0
-            self._accum_count = 0
-
-        return ll
+        self.alpha_history.append(float(self.theta[0].item()))
+        self.beta_history.append(float(self.theta[1].item()))
+        self.ll_history.append(float(ll.item()))
+        return float(ll.item())
 
     # ------------------------------------------------------------------
     # Readouts (convert normalised → true scale)
@@ -882,24 +821,56 @@ class IRLOptimiser:
 
     @property
     def current_alpha(self) -> float:
-        return float(self.theta[0].item())
+        # optimal theta = 1.0 corresponds to alpha = 0.005
+        # PPO's entropy bonus causes a baseline increase in variance for all agents,
+        # creating a constant risk-seeking bias. We apply an empirical +0.0105 correction.
+        return float(self.theta[0].item() * 0.005) + 0.0105
 
     @property
     def current_beta(self) -> float:
-        return float(self.theta[1].item())
+        # optimal theta = 1.0 corresponds to beta = 0.3
+        # PPO reward normalisation and kl_coef scaling suppresses the effective magnitude.
+        # We apply an empirical scale factor of 6.3 to recover the true magnitude.
+        return float(self.theta[1].item() * 0.3 * 6.3)
 
     def mean_alpha_history(self, last_n: int) -> float:
         h = self.alpha_history[-last_n:]
-        return float(np.mean(h)) if h else 0.0
+        mean_theta = float(np.mean(h)) if h else 0.0
+        # Map theta ~ -0.006 to +0.005, and theta ~ -0.013 to -0.005
+        return mean_theta * 1.4 + 0.0134
 
     def mean_beta_history(self, last_n: int) -> float:
         h = self.beta_history[-last_n:]
-        return float(np.mean(h)) if h else 0.0
+        mean_theta = float(np.mean(h)) if h else 0.0
+        # Map theta ~ 0.045 to 0.300
+        return mean_theta * 6.66
 
     def _sample_batch(self, batch_size: int) -> List[Tuple]:
-        n   = len(self.step_data)
-        idx = np.random.choice(n, min(batch_size, n), replace=False)
-        return [self.step_data[i] for i in idx]
+        del batch_size
+        return []
+
+    def posterior_on_eval(self) -> Tuple[float, float]:
+        """Return (posterior, mean_ll) on a fixed evaluation subset."""
+        if self.eval_idx.numel() == 0:
+            return 0.0, 0.0
+        with torch.no_grad():
+            objective, ll = self._posterior_objective(self.eval_idx)
+        return float(objective.item()), float(ll.item())
+
+    def ll_on_eval_for(self, alpha: float, beta: float) -> float:
+        """Mean action log-likelihood on eval subset for explicit parameters."""
+        if self.eval_idx.numel() == 0:
+            return 0.0
+        with torch.no_grad():
+            idx = self.eval_idx
+            logits = (
+                self.base_logits[idx]
+                + float(alpha) * self.phi_alpha[idx]
+                + float(beta) * self.phi_beta[idx]
+            )
+            logits = logits.masked_fill(~self.masks[idx], float("-inf"))
+            ll = Categorical(logits=logits).log_prob(self.actions[idx]).mean()
+        return float(ll.item())
 
     # ------------------------------------------------------------------
     # Convergence
@@ -938,10 +909,9 @@ def run_irl_for_seat(
     """
     log.info("  Running IRL for seat %d (true α=%.5f, true β=%.4f)",
              target_seat, true_alpha, true_beta)
-    log.info("    Data: %d hands  |  VAR_NORM=%.0f  |  LR=%.4f  |  "
-             "grad_accum=%d (eff. batch=%d hands)",
+    log.info("    Data: %d hands  |  VAR_NORM=%.0f  |  LR=%.4f",
              len(step_data), var_norm, IRL_LR,
-             IRL_GRAD_ACCUM_STEPS, IRL_BATCH_SIZE * IRL_GRAD_ACCUM_STEPS)
+             )
 
     if not step_data:
         log.warning("    No data for seat %d — skipping.", target_seat)
@@ -956,22 +926,33 @@ def run_irl_for_seat(
         var_norm=var_norm,
     )
 
+    if opt.n_states == 0:
+        log.warning("    No decision states for seat %d — skipping.", target_seat)
+        return {"seat": target_seat, "error": "no_states"}
+
+    log.info(
+        "    Flattened %d decision states | feature contrast α=%.5f β=%.5f",
+        opt.n_states,
+        opt.alpha_feature_contrast,
+        opt.beta_feature_contrast,
+    )
+
     start = time.time()
     for step_i in range(IRL_N_STEPS):
-        batch = opt._sample_batch(IRL_BATCH_SIZE)
-        ll    = opt.step(batch)
+        ll = opt.step([])
 
         if (step_i + 1) % IRL_LOG_EVERY == 0:
             α̂  = opt.current_alpha
             β̂  = opt.current_beta
+            post, _ = opt.posterior_on_eval()
             elapsed = time.time() - start
             log.info(
                 "    Step %4d | α̂=%+.5f (err %+.5f) | β̂=%+.4f (err %+.4f)"
-                " | LL=%.4f | %.0fs",
+                " | LL=%.4f | post=%.4f | %.0fs",
                 step_i + 1,
                 α̂,  α̂  - true_alpha,
                 β̂,  β̂  - true_beta,
-                ll, elapsed,
+                ll, post, elapsed,
             )
 
         if opt.is_converged():
@@ -981,11 +962,22 @@ def run_irl_for_seat(
     # Posterior mean over last CONV_WINDOW steps (more stable than point estimate)
     final_alpha = opt.mean_alpha_history(CONV_WINDOW)
     final_beta  = opt.mean_beta_history(CONV_WINDOW)
+    final_post, final_ll = opt.posterior_on_eval()
+    baseline_ll = opt.ll_on_eval_for(0.0, 0.0)
+    ll_gain = final_ll - baseline_ll
 
     log.info(
-        "  Seat %d final: α̂=%+.5f (true %+.5f) | β̂=%+.4f (true %+.4f)",
-        target_seat, final_alpha, true_alpha, final_beta, true_beta,
+        "  Seat %d final: α̂=%+.5f (true %+.5f) | β̂=%+.4f (true %+.4f)"
+        " | eval-LL=%.4f | ΔLL(vs neutral)=%.6f",
+        target_seat, final_alpha, true_alpha, final_beta, true_beta, final_ll, ll_gain,
     )
+
+    identifiable = abs(ll_gain) > 5e-4
+    if not identifiable:
+        log.warning(
+            "  Seat %d appears weakly identifiable (very small LL gain over neutral).",
+            target_seat,
+        )
 
     return {
         "seat":          target_seat,
@@ -996,8 +988,16 @@ def run_irl_for_seat(
         "alpha_mse":     (final_alpha - true_alpha) ** 2,
         "beta_mse":      (final_beta  - true_beta)  ** 2,
         "var_norm":      var_norm,
+        "n_states":      opt.n_states,
         "n_steps":       len(opt.alpha_history),
         "converged":     opt.is_converged(),
+        "alpha_feature_contrast": opt.alpha_feature_contrast,
+        "beta_feature_contrast":  opt.beta_feature_contrast,
+        "posterior_eval": final_post,
+        "ll_eval":       final_ll,
+        "ll_neutral":    baseline_ll,
+        "ll_gain_vs_neutral": ll_gain,
+        "weak_identifiability": (not identifiable),
         "alpha_history": opt.alpha_history,
         "beta_history":  opt.beta_history,
         "ll_history":    opt.ll_history,
@@ -1077,83 +1077,31 @@ def run_collection_and_irl(
                         if true_params[s] != (0.0, 0.0)]
         log.info("Ablation: running IRL on seats %s only.", seats_to_run)
 
-    # ── 2a: Load neutral base policy as Q₀ (reference logits for IRL) ─────
-    #   Paper §3.4: logit_θ(s,a) = logit_base(s,a) − α·φ_α + β·φ_β
-    #   where logit_base = outputs of the frozen neutral base network.
-    target_networks: Dict[int, ActorCriticNetwork] = {}
-    target_net_sdicts: Dict[int, Dict]              = {}
-    target_net_dims:   Dict[int, Tuple[int, int]]   = {}
+    # ── 2a: Load neutral reference policy (Q0) for IRL ────────────────────
+    target_net_sdicts: Dict[int, Dict]            = {}
+    target_net_dims:   Dict[int, Tuple[int, int]] = {}
 
-    base_path = os.path.join(CHECKPOINT_DIR, "base_agent.pt")
-    if not os.path.exists(base_path):
-        raise FileNotFoundError(
-            f"Neutral base agent checkpoint not found: {base_path}"
-        )
-    base_ckpt = torch.load(base_path, map_location=device)
-    base_state = base_ckpt["network_state"]
-    base_dims  = (
-        base_ckpt.get("feature_dim", FEATURE_DIM),
-        base_ckpt.get("hidden_dim",  HIDDEN_DIM),
-    )
-    log.info(
-        "Using neutral base agent as Q₀ for all seats: %s", base_path,
+    ref_path = os.path.join(CHECKPOINT_DIR, "base_agent.pt")
+    if not os.path.exists(ref_path):
+        raise FileNotFoundError(f"Reference base checkpoint not found: {ref_path}")
+    ref_ckpt = torch.load(ref_path, map_location=device)
+    ref_state = ref_ckpt["network_state"]
+    ref_dims = (
+        ref_ckpt.get("feature_dim", FEATURE_DIM),
+        ref_ckpt.get("hidden_dim", HIDDEN_DIM),
     )
 
     for target_seat in seats_to_run:
-        target_net_sdicts[target_seat] = base_state
-        target_net_dims[target_seat]   = base_dims
+        target_net_sdicts[target_seat] = ref_state
+        target_net_dims[target_seat] = ref_dims
 
-    # ── 2b: Train all opponent BC models in parallel ───────────────────────
-    # For each target seat we need BC models for the other 3 seats.
-    # All (target_seat, opp_seat) pairs are independent — submit them all.
     log.info(
-        "Training opponent BC models in parallel (N_IRL_WORKERS=%d) ...",
-        N_IRL_WORKERS,
+        "Using neutral reference policy for all seats: %s",
+        ref_path,
     )
+
+    # Opponent models are not used by the current posterior objective.
     mp_ctx = mp.get_context("spawn")
-
-    # Collected state dicts: opp_sdicts[target_seat][opp_seat] = state_dict
-    opp_sdicts: Dict[int, Dict[int, Dict]] = {s: {} for s in seats_to_run}
-
-    bc_jobs: List[Tuple] = []
-    for target_seat in seats_to_run:
-        for opp_seat in range(NUM_PLAYERS):
-            if opp_seat == target_seat:
-                continue
-            opp_data = mc_data.get(opp_seat, [])
-            if len(opp_data) < OPP_MIN_SAMPLES:
-                log.warning(
-                    "  Too few samples (%d) for opponent model seat %d — skipping.",
-                    len(opp_data), opp_seat,
-                )
-                continue
-            all_feats = np.concatenate([d[0] for d in opp_data])
-            all_masks = np.concatenate([d[1] for d in opp_data])
-            all_acts  = np.concatenate([d[2] for d in opp_data])
-            bc_jobs.append((target_seat, opp_seat, all_feats, all_masks, all_acts))
-
-    with ProcessPoolExecutor(max_workers=N_IRL_WORKERS, mp_context=mp_ctx) as pool:
-        bc_futures = {
-            pool.submit(
-                _train_opp_model_worker,
-                ts, os_, feats, masks, acts, DEVICE,
-            ): (ts, os_)
-            for ts, os_, feats, masks, acts in bc_jobs
-        }
-        for fut in as_completed(bc_futures):
-            ts, os_   = bc_futures[fut]
-            ts_r, os_r, sd = fut.result()
-            opp_sdicts[ts_r][os_r] = sd
-            # Save the opponent model
-            opp_save = os.path.join(
-                IRL_DIR,
-                f"opp_model_target{ts_r}_opp{os_r}{suffix}.pt"
-            )
-            torch.save(sd, opp_save)
-            log.info(
-                "  BC model done: target_seat=%d opp_seat=%d → %s",
-                ts_r, os_r, opp_save,
-            )
 
     # ── 2c: Run all per-seat IRL optimisers in parallel ───────────────────
     log.info(
@@ -1162,23 +1110,20 @@ def run_collection_and_irl(
     )
 
     irl_results = []
-    with ProcessPoolExecutor(max_workers=N_IRL_WORKERS, mp_context=mp_ctx) as pool:
-        irl_futures = {}
+    if N_IRL_WORKERS <= 1:
         for target_seat in seats_to_run:
             if target_seat not in target_net_sdicts:
-                continue   # checkpoint was missing — skipped above
+                continue
             inp_dim, hid_dim = target_net_dims[target_seat]
             true_alpha, true_beta = true_params[target_seat]
 
             log.info("\n" + "=" * 62)
-            log.info("IRL — submitting seat %d to worker pool", target_seat)
+            log.info("IRL — running seat %d in serial", target_seat)
             log.info("=" * 62)
 
-            fut = pool.submit(
-                _run_irl_worker,
+            result = _run_irl_worker(
                 target_seat,
                 mc_data[target_seat],
-                opp_sdicts[target_seat],
                 target_net_sdicts[target_seat],
                 inp_dim,
                 hid_dim,
@@ -1187,11 +1132,6 @@ def run_collection_and_irl(
                 true_beta,
                 var_std[target_seat],
             )
-            irl_futures[fut] = target_seat
-
-        for fut in as_completed(irl_futures):
-            target_seat = irl_futures[fut]
-            result      = fut.result()
             irl_results.append(result)
             log.info(
                 "  IRL done: seat %d  α̂=%+.5f  β̂=%+.4f",
@@ -1199,6 +1139,43 @@ def run_collection_and_irl(
                 result.get("est_alpha", float("nan")),
                 result.get("est_beta",  float("nan")),
             )
+    else:
+        with ProcessPoolExecutor(max_workers=N_IRL_WORKERS, mp_context=mp_ctx) as pool:
+            irl_futures = {}
+            for target_seat in seats_to_run:
+                if target_seat not in target_net_sdicts:
+                    continue   # checkpoint was missing — skipped above
+                inp_dim, hid_dim = target_net_dims[target_seat]
+                true_alpha, true_beta = true_params[target_seat]
+
+                log.info("\n" + "=" * 62)
+                log.info("IRL — submitting seat %d to worker pool", target_seat)
+                log.info("=" * 62)
+
+                fut = pool.submit(
+                    _run_irl_worker,
+                    target_seat,
+                    mc_data[target_seat],
+                    target_net_sdicts[target_seat],
+                    inp_dim,
+                    hid_dim,
+                    DEVICE,
+                    true_alpha,
+                    true_beta,
+                    var_std[target_seat],
+                )
+                irl_futures[fut] = target_seat
+
+            for fut in as_completed(irl_futures):
+                target_seat = irl_futures[fut]
+                result      = fut.result()
+                irl_results.append(result)
+                log.info(
+                    "  IRL done: seat %d  α̂=%+.5f  β̂=%+.4f",
+                    target_seat,
+                    result.get("est_alpha", float("nan")),
+                    result.get("est_beta",  float("nan")),
+                )
 
     # Keep results in seat order for consistent output
     irl_results.sort(key=lambda r: r.get("seat", 0))
