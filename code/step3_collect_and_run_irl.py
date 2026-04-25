@@ -122,7 +122,7 @@ DEVICE         = "cpu"
 HIDDEN_DIM     = 256
 
 # Trajectory collection
-N_COLLECTION_HANDS = 5_000
+N_COLLECTION_HANDS = 2**15
 LOG_COLLECT_EVERY  = 5_000
 
 # Number of parallel worker processes for trajectory collection.
@@ -143,9 +143,9 @@ OPP_BATCH_SIZE  = 512
 OPP_MIN_SAMPLES = 200
 
 # IRL gradient ascent
-IRL_LR          = 0.0002     # LR for (alpha, beta)
+IRL_LR          = 0.00001     # LR for (alpha, beta)
 IRL_N_STEPS     = 5_000     # max gradient steps per agent
-IRL_BATCH_SIZE  = 1024       # hands sampled per gradient step
+IRL_BATCH_SIZE  = 2**13       # hands sampled per gradient step
 IRL_PRIOR_SIGMA = 1.0       # Gaussian prior std (in normalised space)
 IRL_GRAD_CLIP   = 5.0       # gradient norm clip for stability
 IRL_LOG_EVERY   = 100
@@ -161,7 +161,7 @@ IRL_LOG_EVERY   = 100
 #
 # Effective batch size = IRL_BATCH_SIZE × IRL_GRAD_ACCUM_STEPS hands.
 # Set to 1 to restore the original single-step behaviour.
-IRL_GRAD_ACCUM_STEPS: int = 8
+IRL_GRAD_ACCUM_STEPS: int = 2
 
 # Convergence (gradient steps)
 CONV_WINDOW     = 300
