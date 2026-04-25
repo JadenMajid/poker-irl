@@ -94,9 +94,9 @@ DEVICE         = "cpu"
 TORCH_THREADS  = max(1, int(os.getenv("POKER_TORCH_THREADS", str(os.cpu_count() or 1))))
 PARALLEL_UPDATE_WORKERS = max(1, int(os.getenv("STEP2_PARALLEL_UPDATE_WORKERS", "1")))
 HIDDEN_DIM     = 256
-LOG_EVERY      = 500
+LOG_EVERY      = 1_000
 SAVE_EVERY     = 50_000
-MAX_HANDS      = 1_000_000
+MAX_HANDS      = 10_000_000
 
 # ── Mini-batch hand accumulation ──────────────────────────────────────────
 # Number of complete hands each agent accumulates before writing transitions
@@ -104,7 +104,7 @@ MAX_HANDS      = 1_000_000
 # commit, smoothing the gradient signal and reducing trendline volatility.
 # Each of the 4 agents maintains its OWN accumulator independently; they
 # commit and update at different wall-clock moments as their buffers fill.
-HANDS_PER_MINI_BATCH: int = 24
+HANDS_PER_MINI_BATCH: int = 256
 
 # When True, terminal rewards within each per-agent mini-batch are
 # standardised (zero-mean / unit-variance) before buffer commit.  This is
@@ -120,10 +120,10 @@ REWARD_NORM_EPS: float = 1e-8
 # alpha units: penalty per unit of chip variance (chips²)
 # beta units : bonus per unit of normalised pot commitment [0,1]
 REWARD_PARAMS = [
-    RewardParams(alpha=+0.004, beta=+0.25),   # Seat 0: risk-averse, pot-hungry
-    RewardParams(alpha=+0.004, beta=-0.20),   # Seat 1: risk-averse, pot-avoidant
-    RewardParams(alpha=-0.003, beta=+0.25),   # Seat 2: risk-seeking, pot-hungry
-    RewardParams(alpha=-0.003, beta=-0.20),   # Seat 3: risk-seeking, pot-avoidant
+    RewardParams(alpha=+0.005, beta=+0.3),   # Seat 0: risk-averse, pot-hungry
+    RewardParams(alpha=+0.005, beta=-0.3),   # Seat 1: risk-averse, pot-avoidant
+    RewardParams(alpha=-0.005, beta=+0.3),   # Seat 2: risk-seeking, pot-hungry
+    RewardParams(alpha=-0.005, beta=-0.3),   # Seat 3: risk-seeking, pot-avoidant
 
     # RewardParams(alpha=+0.00, beta=+0.0),   
     # RewardParams(alpha=+0.00, beta=-0.0),   
@@ -138,21 +138,21 @@ REWARD_PARAMS = [
 # ── PPO config for fine-tuning ─────────────────────────────────────────────
 # Smaller LR and more conservative clip range than base training
 FINETUNE_PPO_CFG = PPOConfig(
-    n_steps_per_update=2048,
+    n_steps_per_update=4096,
     n_epochs=8,
-    mini_batch_size=128,
+    mini_batch_size=256,
     clip_range=0.15,
     value_clip_range=0.15,
     value_coef=0.5,
     entropy_coef=0.005,    # lower entropy encourages specialisation
-    kl_coef=0.01,          # initial KL penalty (annealed below)
+    kl_coef=0.02,          # initial KL penalty (annealed below)
     gae_lambda=0.95,
     gamma=1.0,
     learning_rate=1e-4,    # smaller than base training
     max_grad_norm=0.4,
-    convergence_window=2000,
+    convergence_window=15000,
     convergence_threshold=2e-4,
-    min_hands_before_convergence_check=15_000,
+    min_hands_before_convergence_check=40_000,
     use_lr_schedule=True,
     lr_schedule_T_max=1_200_000,
 )
@@ -162,10 +162,10 @@ KL_ANNEAL_FACTOR = 0.9995   # multiply kl_coef every hand
 KL_FLOOR         = 0.005
 
 # Convergence parameters
-CONV_THRESHOLD  = 2e-4
-CONV_MIN_HANDS  = 15_000
-CONV_CHECK_EVERY= 1000
-CONV_WINDOW     = 2000
+CONV_THRESHOLD  = 1.0e-3
+CONV_MIN_HANDS  = 40_000
+CONV_CHECK_EVERY= 100
+CONV_WINDOW     = 15000
 
 # ---------------------------------------------------------------------------
 logging.basicConfig(
@@ -278,6 +278,12 @@ def _worker_init(
         p.requires_grad_(False)
 
     agent_net = _load_net()
+    perturbed_path = os.path.join(CHECKPOINT_DIR, f"perturbed_agent_{seat}.pt")
+    if os.path.exists(perturbed_path):
+        import logging
+        logging.getLogger(__name__).info("  [Worker] Seat %d: Resuming from %s", seat, perturbed_path)
+        perturbed_ckpt = _torch.load(perturbed_path, map_location=_device)
+        agent_net.load_state_dict(perturbed_ckpt["network_state"])
     agent_net.eval()
 
     cfg = copy.deepcopy(ppo_cfg)
@@ -581,6 +587,13 @@ def run_fine_tuning() -> None:
     agents: List[IndependentAgent] = []
     for seat, params in enumerate(REWARD_PARAMS):
         net   = load_network()
+        
+        perturbed_path = os.path.join(CHECKPOINT_DIR, f"perturbed_agent_{seat}.pt")
+        if os.path.exists(perturbed_path):
+            log.info("  [Main] Seat %d: Resuming from %s", seat, perturbed_path)
+            perturbed_ckpt = torch.load(perturbed_path, map_location=device)
+            net.load_state_dict(perturbed_ckpt["network_state"])
+            
         net.eval()
         cfg   = copy.deepcopy(FINETUNE_PPO_CFG)
         rf    = RewardFunction(params, variance_window=200)

@@ -295,7 +295,7 @@ class RewardFunction:
 
         # --- Compose reward ---
         variance_penalty = self._params.alpha * rolling_var
-        pot_bonus        = self._params.beta  * (max_pot / POT_NORM)
+        pot_bonus        = self._params.beta  * max_pot
 
         total = chip_delta - variance_penalty + pot_bonus
 

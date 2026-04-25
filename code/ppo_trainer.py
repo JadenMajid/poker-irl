@@ -154,14 +154,14 @@ class PPOConfig:
     # Loss coefficients
     value_coef:           float = 0.5
     entropy_coef:         float = 0.01
-    kl_coef:              float = 0.0     # > 0 during fine-tuning
+    kl_coef:              float = 0.01     # > 0 during fine-tuning
 
     # Advantage estimation
     gae_lambda:           float = 0.95
     gamma:                float = 1.0     # no discounting (episodic cash game)
 
     # Optimiser
-    learning_rate:        float = 3e-4
+    learning_rate:        float = 5e-5
     max_grad_norm:        float = 0.5
 
     # Return normalisation — strongly recommended; see module docstring
@@ -169,7 +169,7 @@ class PPOConfig:
 
     # Convergence monitoring
     convergence_window:   int   = 2000
-    convergence_threshold:float = 3e-4
+    convergence_threshold:float = 1.5e-3
     min_hands_before_convergence_check: int = 10_000
 
     # LR schedule (cosine annealing)
@@ -452,7 +452,7 @@ class ConvergenceDetector:
     def __init__(
         self,
         window:      int   = 2000,
-        threshold:   float = 3e-4,
+        threshold:   float = 1e-3,
         min_hands:   int   = 10_000,
         check_every: int   = 1000,
     ) -> None:
@@ -494,11 +494,11 @@ class ConvergenceDetector:
                 kl = _kl_between_snapshots(network, self._snapshot, features, device)
                 self._kl_buf.append(kl)
                 self._all_kls.append(kl)
-                if len(self._kl_buf) > self.window // self.check_every:
+                if len(self._kl_buf) > max(1, self.window // self.check_every):
                     self._kl_buf.pop(0)
             self._snapshot = _clone_params(network)
 
-            if len(self._kl_buf) >= 3:
+            if len(self._kl_buf) >= max(1, self.window // self.check_every):
                 mean_kl = sum(self._kl_buf) / len(self._kl_buf)
                 if mean_kl < self.threshold:
                     self._converged = True

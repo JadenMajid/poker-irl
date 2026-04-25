@@ -179,6 +179,10 @@ def run_evaluation(
         raise FileNotFoundError(f"Hand records not found: {traj_path}  "
                                 "(run step3 first)")
     with open(traj_path, "rb") as f:
+        import __main__
+        import step3_collect_and_run_irl
+        __main__.HandRecord = step3_collect_and_run_irl.HandRecord
+        __main__.StepRecord = step3_collect_and_run_irl.StepRecord
         hand_records: List[HandRecord] = pickle.load(f)
     log.info("Loaded %d hand records.", len(hand_records))
 

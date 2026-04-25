@@ -15,12 +15,8 @@ else
 fi
 
 # 2. Fine-tune specialized agents with different playstyles
-if [[ -f checkpoints/perturbed_agent_0.pt && -f checkpoints/perturbed_agent_1.pt && -f checkpoints/perturbed_agent_2.pt && -f checkpoints/perturbed_agent_3.pt ]]; then
-	echo "[train] SKIP step2: final perturbed agent checkpoints already exist"
-else
-	echo "[train] RUN  step2: fine-tuning perturbed agents"
-	python code/step2_train_perturbed_agents.py
-fi
+echo "[train] RUN  step2: fine-tuning perturbed agents (resuming if checkpoints exist)"
+python code/step2_train_perturbed_agents.py
 
 # 3. Collect data and run the IRL recovery process
 if [[ -f irl_results/irl_estimates.json && -f irl_results/irl_convergence_log.json ]]; then

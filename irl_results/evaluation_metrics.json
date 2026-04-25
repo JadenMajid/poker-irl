@@ -1,0 +1,14 @@
+{
+  "mean_alpha_mse": 3.6720082269720625e-05,
+  "mean_beta_mse": 0.0005615738053283373,
+  "mean_joint_mse": 0.00029914694379902897,
+  "mean_alpha_rmse": 0.005711828845737198,
+  "mean_beta_rmse": 0.01923676942454622,
+  "mean_holl_estimated": -434.62309653111237,
+  "mean_holl_true": -321.1572901384851,
+  "mean_holl_neutral": -1.52976053400397,
+  "mean_holl_random": -1.465348837462791,
+  "mean_holl_recovery_pct": -139.9915752868323,
+  "n_seats_evaluated": 4,
+  "is_ablation": false
+}
