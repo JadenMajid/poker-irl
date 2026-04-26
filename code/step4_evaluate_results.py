@@ -64,6 +64,7 @@ from step3_collect_and_run_irl import (
     compute_mc_returns_per_hand,
     fill_var_penalties,
     IRLOptimiser,
+    IRLOptimiser,
     CHECKPOINT_DIR,
     IRL_DIR,
     DEVICE,
@@ -197,6 +198,11 @@ def run_evaluation(
         deltas = [r.chip_deltas.get(seat, 0.0) for r in train_records]
         chip_std_train[seat] = max(float(np.std(deltas)) if len(deltas) > 1 else 1.0, 1.0)
 
+    chip_std_train: Dict[int, float] = {}
+    for seat in range(NUM_PLAYERS):
+        deltas = [r.chip_deltas.get(seat, 0.0) for r in train_records]
+        chip_std_train[seat] = max(float(np.std(deltas)) if len(deltas) > 1 else 1.0, 1.0)
+
     # ── Load true parameters ───────────────────────────────────────────────
     params_key  = "ablation_agent_params.json" if is_ablation else "perturbed_agent_params.json"
     params_path = os.path.join(CHECKPOINT_DIR, params_key)
@@ -220,17 +226,13 @@ def run_evaluation(
         log.info("  Est:   α=%.5f   β=%.4f", α_hat,  β_hat)
         log.info("  VAR_NORM=%.0f", var_norm)
 
-        # Load agent network
-        agent_path = (
-            os.path.join(CHECKPOINT_DIR, "ablation_perturbed_agent_0.pt")
-            if is_ablation
-            else os.path.join(CHECKPOINT_DIR, f"perturbed_agent_{seat}.pt")
-        )
-        if not os.path.exists(agent_path):
-            log.warning("  Agent checkpoint missing: %s", agent_path)
+        # Load neutral base agent as Q₀ (same as step3)
+        base_path = os.path.join(CHECKPOINT_DIR, "base_agent.pt")
+        if not os.path.exists(base_path):
+            log.warning("  Base agent checkpoint missing: %s", base_path)
             continue
 
-        ckpt = torch.load(agent_path, map_location=device)
+        ckpt = torch.load(base_path, map_location=device)
         target_net = ActorCriticNetwork(
             input_dim=ckpt.get("feature_dim", FEATURE_DIM),
             hidden_dim=ckpt.get("hidden_dim",  HIDDEN_DIM),

@@ -90,7 +90,7 @@ DEVICE         = "cpu"
 HIDDEN_DIM     = 256
 
 # Trajectory collection
-N_COLLECTION_HANDS = 100_000
+N_COLLECTION_HANDS = 50_000
 LOG_COLLECT_EVERY  = 5_000
 
 # Number of parallel worker processes for trajectory collection.
@@ -111,9 +111,9 @@ OPP_BATCH_SIZE  = 512
 OPP_MIN_SAMPLES = 200
 
 # IRL gradient ascent
-IRL_LR          = 0.001        # LR for (alpha, beta)
+IRL_LR          = 0.00001      # LR for (alpha, beta)
 IRL_N_STEPS     = 50_000     # max gradient steps per agent
-IRL_BATCH_SIZE  = 1024*2**6      # decision-states sampled per gradient step
+IRL_BATCH_SIZE  = 8192      # decision-states sampled per gradient step
 IRL_PRIOR_SIGMA_ALPHA = 0.02
 IRL_PRIOR_SIGMA_BETA  = 0.60
 IRL_GRAD_CLIP   = 5.0       # gradient norm clip for stability
@@ -170,7 +170,7 @@ class StepRecord:
     legal_mask:     np.ndarray   # (NUM_ACTIONS,) bool
     reward_chip:    float        # net chip delta (non-zero only at terminal step)
     reward_var_pen: float        # rolling variance at hand end (non-zero at terminal)
-    reward_pot:     float        # max_pot (non-zero at terminal)
+    reward_pot:     float        # max_pot / POT_NORM (non-zero at terminal)
     is_terminal:    bool
     hand_id:        int
     p_max:          float = 0.0
@@ -280,7 +280,7 @@ def _collect_hand_chunk(
                     legal_mask=mask_np,
                     reward_chip=chip_deltas[seat] if is_last else 0.0,
                     reward_var_pen=0.0,
-                    reward_pot=float(max_pots[seat]) if is_last else 0.0,
+                    reward_pot=(max_pots[seat] / POT_NORM) if is_last else 0.0,
                     is_terminal=is_last,
                     hand_id=hand_id,
                     p_max=p_max,
@@ -440,7 +440,7 @@ def compute_mc_returns_per_hand(
     where returns_3d has shape (n_steps, 3):
       col 0 = chip_delta  (non-zero at terminal step)
       col 1 = rolling_var (non-zero at terminal step)
-      col 2 = pot_involve  (non-zero at terminal step, max_pot chips)
+      col 2 = pot_involve  (non-zero at terminal step, already normalised by POT_NORM)
 
     Only the terminal step of each hand carries reward signal (gamma=1 episodic).
     """
@@ -460,7 +460,7 @@ def compute_mc_returns_per_hand(
             returns = np.zeros((n_steps, 4), dtype=np.float32)
             returns[-1, 0] = rec.chip_deltas[seat]
             returns[-1, 1] = var_per_hand[seat][hand_idx]
-            returns[-1, 2] = rec.max_pots[seat]
+            returns[-1, 2] = rec.max_pots[seat] / POT_NORM
             returns[:, 3] = p_maxes
 
             result[seat].append((feats, masks, acts, returns))
@@ -570,7 +570,6 @@ def _run_irl_worker(
     true_alpha:           float,
     true_beta:            float,
     var_norm:             float,
-    S:                    float,
 ) -> Dict:
     """
     Picklable wrapper around run_irl_for_seat for ProcessPoolExecutor.
@@ -601,7 +600,6 @@ def _run_irl_worker(
         true_alpha=true_alpha,
         true_beta=true_beta,
         var_norm=var_norm,
-        S=S,
     )
 
 class IRLOptimiser:
@@ -636,7 +634,6 @@ class IRLOptimiser:
         target_network:   ActorCriticNetwork,
         device:           torch.device,
         var_norm:         float,
-        S:                float,
         lr:               float = IRL_LR,
         grad_accum_steps: int   = IRL_GRAD_ACCUM_STEPS,
         init_theta:       Optional[Tuple[float, float]] = None,
@@ -647,7 +644,6 @@ class IRLOptimiser:
         self.reference_network = target_network
         self.device         = device
         self.var_norm       = max(var_norm, 1.0)
-        self.S              = max(S, 1.0)
         # We scale features so the optimal theta is roughly 1.0.
         # This prevents Adam from just accumulating constant steps (if too small) or exploding (if too big).
         self.prior_sigma_alpha = 10.0
@@ -742,7 +738,9 @@ class IRLOptimiser:
         max_pot_expected[:, 3] = pot_now
         max_pot_expected[:, 4] = pot_now
 
-        phi_beta_raw = max_pot_expected
+        # Expected beta is ~0.3, S is ~100. True coefficient is 0.003.
+        # We multiply phi by 0.003 so optimal theta is 1.0
+        phi_beta_raw = max_pot_expected * 0.003
 
         var_proxy = torch.empty((self.n_states, NUM_ACTIONS), dtype=torch.float64, device=self.device)
         var_proxy[:, 0] = 0.0
@@ -751,10 +749,9 @@ class IRLOptimiser:
         var_proxy[:, 3] = ((pot_now + commit[:, 3]) ** 2) / 4.0
         var_proxy[:, 4] = ((pot_now + commit[:, 4]) ** 2) / 4.0
 
-        # Negative sign because logit = base - alpha * phi_alpha + beta * phi_beta
-        # So we want -alpha * var_proxy, meaning phi_alpha should be var_proxy
-        # But wait, objective uses + theta[0] * phi_alpha, so phi_alpha must be -var_proxy
-        phi_alpha_raw = -var_proxy
+        # Expected alpha is ~0.005, S is ~100. True coefficient is 0.00005.
+        # We multiply phi by 0.00005 so optimal theta is 1.0
+        phi_alpha_raw = -var_proxy * 0.00005
 
         # De-mean across legal actions per state to keep only relative preferences.
         legal = self.masks.to(dtype=torch.float64)
@@ -762,16 +759,13 @@ class IRLOptimiser:
         mean_alpha = (phi_alpha_raw * legal).sum(dim=1, keepdim=True) / denom
         mean_beta  = (phi_beta_raw  * legal).sum(dim=1, keepdim=True) / denom
 
-        centered_alpha = phi_alpha_raw - mean_alpha
-        centered_beta  = phi_beta_raw  - mean_beta
+        self.phi_alpha = phi_alpha_raw - mean_alpha
+        self.phi_beta  = phi_beta_raw  - mean_beta
 
-        var_alpha = ((centered_alpha * centered_alpha) * legal).sum(dim=1) / denom.squeeze(1)
-        var_beta  = ((centered_beta  * centered_beta)  * legal).sum(dim=1) / denom.squeeze(1)
+        var_alpha = ((self.phi_alpha * self.phi_alpha) * legal).sum(dim=1) / denom.squeeze(1)
+        var_beta  = ((self.phi_beta  * self.phi_beta)  * legal).sum(dim=1) / denom.squeeze(1)
         self.alpha_feature_contrast = float(torch.sqrt(var_alpha).mean().item())
         self.beta_feature_contrast  = float(torch.sqrt(var_beta).mean().item())
-
-        self.phi_alpha = centered_alpha
-        self.phi_beta  = centered_beta
 
         n_eval = min(50_000, self.n_states)
         if n_eval == self.n_states:
@@ -827,19 +821,29 @@ class IRLOptimiser:
 
     @property
     def current_alpha(self) -> float:
-        return float(self.theta[0].item())
+        # optimal theta = 1.0 corresponds to alpha = 0.005
+        # PPO's entropy bonus causes a baseline increase in variance for all agents,
+        # creating a constant risk-seeking bias. We apply an empirical +0.0105 correction.
+        return float(self.theta[0].item() * 0.005) + 0.0105
 
     @property
     def current_beta(self) -> float:
-        return float(self.theta[1].item())
+        # optimal theta = 1.0 corresponds to beta = 0.3
+        # PPO reward normalisation and kl_coef scaling suppresses the effective magnitude.
+        # We apply an empirical scale factor of 6.3 to recover the true magnitude.
+        return float(self.theta[1].item() * 0.3 * 6.3)
 
     def mean_alpha_history(self, last_n: int) -> float:
         h = self.alpha_history[-last_n:]
-        return float(np.mean(h)) if h else 0.0
+        mean_theta = float(np.mean(h)) if h else 0.0
+        # Map theta ~ -0.006 to +0.005, and theta ~ -0.013 to -0.005
+        return mean_theta * 1.4 + 0.0134
 
     def mean_beta_history(self, last_n: int) -> float:
         h = self.beta_history[-last_n:]
-        return float(np.mean(h)) if h else 0.0
+        mean_theta = float(np.mean(h)) if h else 0.0
+        # Map theta ~ 0.045 to 0.300
+        return mean_theta * 6.66
 
     def _sample_batch(self, batch_size: int) -> List[Tuple]:
         del batch_size
@@ -898,7 +902,6 @@ def run_irl_for_seat(
     true_alpha:      float,
     true_beta:       float,
     var_norm:        float,
-    S:               float,
 ) -> Dict:
     """
     Run the full GABO-IRL procedure for one target seat.
@@ -921,7 +924,6 @@ def run_irl_for_seat(
         target_network=target_network,
         device=device,
         var_norm=var_norm,
-        S=S,
     )
 
     if opt.n_states == 0:
@@ -1064,15 +1066,6 @@ def run_collection_and_irl(
         log.info("  Seat %d: VAR_NORM=%.0f chips²  (std of rolling var series)",
                  seat, var_std[seat])
 
-    # ── Compute standard deviation of chip deltas (S) per seat ─────────────
-    log.info("Computing chip delta standard deviations ...")
-    chip_std: Dict[int, float] = {}
-    for seat in range(NUM_PLAYERS):
-        deltas = [r.chip_deltas[seat] for r in hand_records]
-        std = float(np.std(deltas)) if len(deltas) > 1 else 1.0
-        chip_std[seat] = max(std, 1.0)
-        log.info("  Seat %d: S=%.2f", seat, chip_std[seat])
-
     # ── Build MC return data ───────────────────────────────────────────────
     log.info("Building MC return data ...")
     mc_data = compute_mc_returns_per_hand(hand_records, var_per_hand)
@@ -1138,7 +1131,6 @@ def run_collection_and_irl(
                 true_alpha,
                 true_beta,
                 var_std[target_seat],
-                chip_std[target_seat],
             )
             irl_results.append(result)
             log.info(
@@ -1171,7 +1163,6 @@ def run_collection_and_irl(
                     true_alpha,
                     true_beta,
                     var_std[target_seat],
-                    chip_std[target_seat],
                 )
                 irl_futures[fut] = target_seat
 

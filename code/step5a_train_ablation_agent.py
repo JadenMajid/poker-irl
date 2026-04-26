@@ -86,7 +86,7 @@ DEVICE         = "cpu"
 HIDDEN_DIM     = 256
 LOG_EVERY      = 500
 SAVE_EVERY     = 10_000
-MAX_HANDS      = 1_000_000
+MAX_HANDS      = 100_000
 
 # Number of complete hands to accumulate before each PPO update.
 # Larger values → lower gradient variance, smoother trendlines, but less
@@ -111,8 +111,8 @@ ABLATION_REWARD_PARAMS = RewardParams(alpha=0.005, beta=.3)
 
 # Fine-tuning PPO config (same as step2)
 ABLATION_PPO_CFG = PPOConfig(
-    n_steps_per_update=2048,
-    n_epochs=8,
+    n_steps_per_update=512,
+    n_epochs=4,
     mini_batch_size=128,
     clip_range=0.15,
     value_clip_range=0.15,
@@ -121,10 +121,10 @@ ABLATION_PPO_CFG = PPOConfig(
     kl_coef=0.05,
     gae_lambda=0.95,
     gamma=1.0,
-    learning_rate=1e-4,
+    learning_rate=1e-3,
     max_grad_norm=0.4,
     convergence_window=2000,
-    convergence_threshold=2e-4,
+    convergence_threshold=1e-3,
     min_hands_before_convergence_check=15_000,
     use_lr_schedule=True,
     lr_schedule_T_max=900_000,
@@ -134,9 +134,9 @@ KL_ANNEAL_FACTOR = 0.9995
 KL_FLOOR         = 0.005
 
 CONV_THRESHOLD   = 1e-3
-CONV_MIN_HANDS   = 15_000
+CONV_MIN_HANDS   = 1_000
 CONV_CHECK_EVERY = 1000
-CONV_WINDOW      = 2000
+CONV_WINDOW      = 5000
 
 # ---------------------------------------------------------------------------
 logging.basicConfig(
